@@ -254,17 +254,36 @@ typedef unsigned int pymem_uint;  /* assuming >= 16 bits */
 /* When you say memory, my mind reasons in terms of (pointers to) blocks */
 typedef uint8_t pymem_block;
 
+#if SIZEOF_VOID_P > 4
+#  define _Py_POOL_REF_PADDING_SIZE 4
+#else
+#  define _Py_POOL_REF_PADDING_SIZE 1
+#endif
+
+_Static_assert(sizeof(struct {
+    uint16_t count;
+    uint8_t szidx;
+    uint8_t flags[_Py_POOL_REF_PADDING_SIZE];
+}) == sizeof(pymem_block *),
+               "pool_header_ref must fit in pointer-sized space");
+
 /* Pool for small blocks. */
 struct pool_header {
-    union { pymem_block *_padding;
-            uint count; } ref;          /* number of allocated blocks    */
-    pymem_block *freeblock;             /* pool's free list head         */
-    struct pool_header *nextpool;       /* see "Pool table" for meaning  */
-    struct pool_header *prevpool;       /* "                             */
-    uint arenaindex;                    /* index into arenas of base adr */
-    uint szidx;                         /* block size class index        */
-    uint nextoffset;                    /* bytes to virgin block         */
-    uint maxnextoffset;                 /* largest valid nextoffset      */
+    union {
+        pymem_block *_padding;
+        struct {
+            uint16_t count;          /* number of allocated blocks    */
+            uint8_t szidx;           /* block size class index        */
+            uint8_t flags[_Py_POOL_REF_PADDING_SIZE];   /* uses remaining bytes */
+        };
+    };
+    pymem_block *freeblock;          /* pool's free list head         */
+    struct pool_header *nextpool;    /* see "Pool table" for meaning  */
+    struct pool_header *prevpool;    /* "                             */
+    void* metadata;                  /* pool metadata                  */
+    uint arenaindex;                 /* index into arenas of base adr */
+    uint16_t nextoffset;             /* bytes to virgin block         */
+    uint16_t maxnextoffset;          /* largest valid nextoffset      */
 };
 
 typedef struct pool_header *poolp;
@@ -312,7 +331,7 @@ struct arena_object {
 
 #define POOL_OVERHEAD   _Py_SIZE_ROUND_UP(sizeof(struct pool_header), ALIGNMENT)
 
-#define DUMMY_SIZE_IDX          0xffff  /* size class of newly cached pools */
+#define DUMMY_SIZE_IDX          0xff  /* size class of newly cached pools */
 
 /* Round pointer P down to the closest pool-aligned address <= P, as a poolp */
 #define POOL_ADDR(P) ((poolp)_Py_ALIGN_DOWN((P), POOL_SIZE))
@@ -401,7 +420,8 @@ compensating for that a pool_header's nextpool and prevpool members
 immediately follow a pool_header's first two members:
 
     union { pymem_block *_padding;
-            uint count; } ref;
+            struct { uint16_t count; uint8_t szidx;
+                     uint8_t flags[_Py_POOL_REF_PADDING_SIZE]; }; };
     pymem_block *freeblock;
 
 each of which consume sizeof(pymem_block *) bytes.  So what usedpools[i+i] really

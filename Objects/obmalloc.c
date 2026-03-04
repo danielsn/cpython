@@ -1789,7 +1789,7 @@ _PyInterpreterState_GetAllocatedBlocks(PyInterpreterState *interp)
         assert(base <= (uintptr_t) allarenas[i].pool_address);
         for (; base < (uintptr_t) allarenas[i].pool_address; base += POOL_SIZE) {
             poolp p = (poolp)base;
-            n += p->ref.count;
+            n += p->count;
         }
     }
     return n;
@@ -2376,7 +2376,9 @@ allocate_from_new_pool(OMState *state, uint size)
     pool->prevpool = next;
     next->nextpool = pool;
     next->prevpool = pool;
-    pool->ref.count = 1;
+    pool->count = 1;
+    pool->metadata = NULL;
+    memset(pool->flags, 0, sizeof(pool->flags));
     if (pool->szidx == size) {
         /* Luckily, this pool last contained blocks
          * of the same size class, so its header
@@ -2438,7 +2440,7 @@ pymalloc_alloc(OMState *state, void *Py_UNUSED(ctx), size_t nbytes)
          * There is a used pool for this size class.
          * Pick up the head block of its free list.
          */
-        ++pool->ref.count;
+        ++pool->count;
         bp = pool->freeblock;
         assert(bp != NULL);
 
@@ -2499,7 +2501,7 @@ _PyObject_Calloc(void *ctx, size_t nelem, size_t elsize)
 static void
 insert_to_usedpool(OMState *state, poolp pool)
 {
-    assert(pool->ref.count > 0);            /* else the pool is empty */
+    assert(pool->count > 0);            /* else the pool is empty */
 
     uint size = pool->szidx;
     poolp next = usedpools[size + size];
@@ -2523,6 +2525,8 @@ insert_to_freepool(OMState *state, poolp pool)
     /* Link the pool to freepools.  This is a singly-linked
      * list, and pool->prevpool isn't used there.
      */
+    assert(pool->metadata == NULL);
+    memset(pool->flags, 0, sizeof(pool->flags));
     struct arena_object *ao = &allarenas[pool->arenaindex];
     pool->nextpool = ao->freepools;
     ao->freepools = pool;
@@ -2705,11 +2709,11 @@ pymalloc_free(OMState *state, void *Py_UNUSED(ctx), void *p)
      * was full and is in no list -- it's not in the freeblocks
      * list in any case).
      */
-    assert(pool->ref.count > 0);            /* else it was empty */
+    assert(pool->count > 0);            /* else it was empty */
     pymem_block *lastfree = pool->freeblock;
     *(pymem_block **)p = lastfree;
     pool->freeblock = (pymem_block *)p;
-    pool->ref.count--;
+    pool->count--;
 
     if (UNLIKELY(lastfree == NULL)) {
         /* Pool was full, so doesn't currently live in any list:
@@ -2725,7 +2729,7 @@ pymalloc_free(OMState *state, void *Py_UNUSED(ctx), void *p)
     /* freeblock wasn't NULL, so the pool wasn't full,
      * and the pool is in a usedpools[] list.
      */
-    if (LIKELY(pool->ref.count != 0)) {
+    if (LIKELY(pool->count != 0)) {
         /* pool isn't empty:  leave it in usedpools */
         return 1;
     }
@@ -3675,7 +3679,7 @@ pymalloc_print_stats(FILE *out)
             const uint sz = p->szidx;
             uint freeblocks;
 
-            if (p->ref.count == 0) {
+            if (p->count == 0) {
                 /* currently unused */
 #ifdef Py_DEBUG
                 assert(pool_is_in_list(p, allarenas[i].freepools));
@@ -3683,8 +3687,8 @@ pymalloc_print_stats(FILE *out)
                 continue;
             }
             ++numpools[sz];
-            numblocks[sz] += p->ref.count;
-            freeblocks = NUMBLOCKS(sz) - p->ref.count;
+            numblocks[sz] += p->count;
+            freeblocks = NUMBLOCKS(sz) - p->count;
             numfreeblocks[sz] += freeblocks;
 #ifdef Py_DEBUG
             if (freeblocks > 0)
