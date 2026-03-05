@@ -8,14 +8,19 @@ Run with:
 Or run the built-in verification (spawns subprocess):
     ./python.exe test_heap_profile.py --check
 
-This exercises the heap profiler by allocating and freeing many small objects.
-The profiler tracks 1 in N allocations (default 10) via a linked list in each
-pool's metadata. When tracked objects are freed, they are printed to stderr.
+This exercises the heap profiler by allocating and freeing small and large
+objects. Small allocations use pool metadata; large allocations use an extra
+pointer before the object. When tracked objects are freed, they are printed.
 """
 import sys
 import subprocess
 import gc
 import os
+
+
+# pymalloc threshold: allocations larger than this use the system allocator
+# and are not tracked by the heap profiler (see SMALL_REQUEST_THRESHOLD in obmalloc.c)
+PYMALLOC_THRESHOLD = 512
 
 
 def run_with_profiling():
@@ -25,6 +30,12 @@ def run_with_profiling():
         y = (10, 20, 30)
         z = {"a": 1, "b": 2}
         del x, y, z
+
+    # Allocate and free large objects (> pymalloc threshold) - tracked via
+    # metadata prefix before the object
+    for i in range(50):
+        large = bytearray(PYMALLOC_THRESHOLD + 1)
+        del large
 
     gc.collect()
     return 0
@@ -49,6 +60,21 @@ def main():
             print("Test failed: no 'heap profile free:' lines in stderr")
             print("stderr sample:", result.stderr[:500])
             return 1
+
+        # Verify large allocations are tracked (size > 512)
+        import re
+        has_large = False
+        for line in result.stderr.splitlines():
+            if "heap profile free:" in line:
+                m = re.search(r"size=(\d+)", line)
+                if m:
+                    size = int(m.group(1))
+                    if size > PYMALLOC_THRESHOLD:
+                        has_large = True
+        if not has_large:
+            print("Test failed: no large allocation tracking (size > 512)")
+            return 1
+
         print("OK: heap profiling produced expected output")
         return 0
 

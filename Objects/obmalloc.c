@@ -2258,12 +2258,41 @@ address_in_range(OMState *state, void *p, poolp pool)
 struct heap_profile_entry {
     pymem_block *ptr;
     uint64_t alloc_count;
+    size_t size;
     struct heap_profile_entry *next;       /* per-pool list (pool->metadata) */
     struct heap_profile_entry *global_next;
     struct heap_profile_entry *global_prev;
 };
 
 static struct heap_profile_entry *heap_profile_list_head;
+
+static void
+heap_profile_global_insert(struct heap_profile_entry *ent)
+{
+    ent->global_next = heap_profile_list_head;
+    ent->global_prev = NULL;
+    if (heap_profile_list_head != NULL) {
+        heap_profile_list_head->global_prev = ent;
+    }
+    heap_profile_list_head = ent;
+}
+
+static void
+heap_profile_global_remove(struct heap_profile_entry *ent)
+{
+    if (ent->global_prev != NULL) {
+        ent->global_prev->global_next = ent->global_next;
+    } else {
+        heap_profile_list_head = ent->global_next;
+    }
+    if (ent->global_next != NULL) {
+        ent->global_next->global_prev = ent->global_prev;
+    }
+}
+
+/* Large allocation: always reserve one extra pointer before the object.
+ * Prefix is NULL if unused, or a pointer to heap_profile_entry. */
+#define HEAP_PROFILE_LARGE_PREFIX sizeof(void *)
 
 static uint heap_profile_sample_rate;
 static uint64_t heap_profile_alloc_counter;
@@ -2287,6 +2316,24 @@ init_heap_profile_sampling(void)
     heap_profile_print_enabled = (env != NULL && env[0] != '\0');
 }
 
+/* Free a large block. We always allocated the prefix; it is NULL or metadata ptr. */
+static void
+heap_profile_free_large_block(void *p)
+{
+    void *block = (char *)p - HEAP_PROFILE_LARGE_PREFIX;
+    void *metadata = *(void **)block;
+    if (metadata != NULL) {
+        struct heap_profile_entry *ent = metadata;
+        heap_profile_global_remove(ent);
+        if (heap_profile_print_enabled) {
+            fprintf(stderr, "heap profile free: %p size=%zu alloc_count=%llu\n",
+                    p, ent->size, (unsigned long long)ent->alloc_count);
+        }
+        PyMem_RawFree(metadata);
+    }
+    PyMem_RawFree(block);
+}
+
 static void
 heap_profile_remove_and_print(poolp pool, pymem_block *p)
 {
@@ -2295,10 +2342,10 @@ heap_profile_remove_and_print(poolp pool, pymem_block *p)
         struct heap_profile_entry *ent = *pnext;
         if (ent->ptr == p) {
             *pnext = ent->next;
+            heap_profile_global_remove(ent);
             if (heap_profile_print_enabled) {
-                uint block_size = INDEX2SIZE(pool->szidx);
-                fprintf(stderr, "heap profile free: %p size=%u alloc_count=%llu\n",
-                        (void *)p, block_size, (unsigned long long)ent->alloc_count);
+                fprintf(stderr, "heap profile free: %p size=%zu alloc_count=%llu\n",
+                    (void *)p, ent->size, (unsigned long long)ent->alloc_count);
             }
             PyMem_RawFree(ent);
             return;
@@ -2524,8 +2571,10 @@ pymalloc_alloc(OMState *state, void *Py_UNUSED(ctx), size_t nbytes)
                 poolp alloc_pool = POOL_ADDR(bp);  /* bp may be from allocate_from_new_pool */
                 ent->ptr = bp;
                 ent->alloc_count = heap_profile_alloc_counter;
+                ent->size = INDEX2SIZE(alloc_pool->szidx);
                 ent->next = alloc_pool->metadata;
                 alloc_pool->metadata = ent;
+                heap_profile_global_insert(ent);
             }
         }
     }
@@ -2543,11 +2592,34 @@ _PyObject_Malloc(void *ctx, size_t nbytes)
         return ptr;
     }
 
-    ptr = PyMem_RawMalloc(nbytes);
-    if (ptr != NULL) {
-        raw_allocated_blocks++;
+    /* Large allocation: always reserve prefix (NULL or metadata ptr) */
+    if (UNLIKELY(!heap_profile_initialized)) {
+        init_heap_profile_sampling();
     }
-    return ptr;
+    void *block = PyMem_RawMalloc(nbytes + HEAP_PROFILE_LARGE_PREFIX);
+    if (block == NULL) {
+        return NULL;
+    }
+    raw_allocated_blocks++;
+
+    void *metadata = NULL;
+    if (heap_profile_sample_rate > 0) {
+        heap_profile_alloc_counter++;
+        if ((heap_profile_alloc_counter % heap_profile_sample_rate) == 0) {
+            struct heap_profile_entry *ent =
+                PyMem_RawMalloc(sizeof(*ent));
+            if (ent != NULL) {
+                ent->ptr = NULL;  /* unused for large */
+                ent->alloc_count = heap_profile_alloc_counter;
+                ent->size = nbytes;
+                ent->next = NULL;
+                heap_profile_global_insert(ent);
+                metadata = ent;
+            }
+        }
+    }
+    *(void **)block = metadata;
+    return (char *)block + HEAP_PROFILE_LARGE_PREFIX;
 }
 
 
@@ -2564,11 +2636,34 @@ _PyObject_Calloc(void *ctx, size_t nelem, size_t elsize)
         return ptr;
     }
 
-    ptr = PyMem_RawCalloc(nelem, elsize);
-    if (ptr != NULL) {
-        raw_allocated_blocks++;
+    /* Large allocation: always reserve prefix (NULL or metadata ptr) */
+    if (UNLIKELY(!heap_profile_initialized)) {
+        init_heap_profile_sampling();
     }
-    return ptr;
+    void *block = PyMem_RawCalloc(1, nbytes + HEAP_PROFILE_LARGE_PREFIX);
+    if (block == NULL) {
+        return NULL;
+    }
+    raw_allocated_blocks++;
+
+    void *metadata = NULL;
+    if (heap_profile_sample_rate > 0) {
+        heap_profile_alloc_counter++;
+        if ((heap_profile_alloc_counter % heap_profile_sample_rate) == 0) {
+            struct heap_profile_entry *ent =
+                PyMem_RawMalloc(sizeof(*ent));
+            if (ent != NULL) {
+                ent->ptr = NULL;  /* unused for large */
+                ent->alloc_count = heap_profile_alloc_counter;
+                ent->size = nbytes;
+                ent->next = NULL;
+                heap_profile_global_insert(ent);
+                metadata = ent;
+            }
+        }
+    }
+    *(void **)block = metadata;
+    return (char *)block + HEAP_PROFILE_LARGE_PREFIX;
 }
 
 
@@ -2834,8 +2929,8 @@ _PyObject_Free(void *ctx, void *p)
 
     OMState *state = get_state();
     if (UNLIKELY(!pymalloc_free(state, ctx, p))) {
-        /* pymalloc didn't allocate this address */
-        PyMem_RawFree(p);
+        /* Large allocation: we always allocated the prefix */
+        heap_profile_free_large_block(p);
         raw_allocated_blocks--;
     }
 }
@@ -2926,7 +3021,18 @@ _PyObject_Realloc(void *ctx, void *ptr, size_t nbytes)
         return ptr2;
     }
 
-    return PyMem_RawRealloc(ptr, nbytes);
+    /* Large allocation: we always allocated the prefix */
+    void *block = (char *)ptr - HEAP_PROFILE_LARGE_PREFIX;
+    void *new_block = PyMem_RawRealloc(block, nbytes + HEAP_PROFILE_LARGE_PREFIX);
+    if (new_block != NULL) {
+        /* Metadata is preserved (realloc copies the prefix). Just update size. */
+        void *metadata = *(void **)new_block;
+        if (metadata != NULL) {
+            ((struct heap_profile_entry *)metadata)->size = nbytes;
+        }
+        return (char *)new_block + HEAP_PROFILE_LARGE_PREFIX;
+    }
+    return NULL;
 }
 
 #else   /* ! WITH_PYMALLOC */
