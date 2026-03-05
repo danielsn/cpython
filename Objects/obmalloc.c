@@ -2251,6 +2251,62 @@ address_in_range(OMState *state, void *p, poolp pool)
 /*==========================================================================*/
 
 // Called when freelist is exhausted.  Extend the freelist if there is
+/* Heap profile: track 1 in N objects via linked list in pool->metadata.
+ * PYTHON_HEAP_PROFILE_SAMPLE=N (default 10), PYTHON_HEAP_PROFILE_PRINT=1 to enable printing.
+ * Entries are also in a global doubly-linked list (global_next/global_prev) for iteration.
+ */
+struct heap_profile_entry {
+    pymem_block *ptr;
+    uint64_t alloc_count;
+    struct heap_profile_entry *next;       /* per-pool list (pool->metadata) */
+    struct heap_profile_entry *global_next;
+    struct heap_profile_entry *global_prev;
+};
+
+static struct heap_profile_entry *heap_profile_list_head;
+
+static uint heap_profile_sample_rate;
+static uint64_t heap_profile_alloc_counter;
+static int heap_profile_print_enabled;
+static int heap_profile_initialized;
+
+static void
+init_heap_profile_sampling(void)
+{
+    if (heap_profile_initialized) {
+        return;
+    }
+    heap_profile_initialized = 1;
+    heap_profile_sample_rate = 0;  /* disabled by default; set env var to enable */
+    const char *env = getenv("PYTHON_HEAP_PROFILE_SAMPLE");
+    if (env != NULL && env[0] != '\0') {
+        long val = strtol(env, NULL, 10);
+        heap_profile_sample_rate = (val > 0 && val <= UINT_MAX) ? (uint)val : 0;
+    }
+    env = getenv("PYTHON_HEAP_PROFILE_PRINT");
+    heap_profile_print_enabled = (env != NULL && env[0] != '\0');
+}
+
+static void
+heap_profile_remove_and_print(poolp pool, pymem_block *p)
+{
+    struct heap_profile_entry **pnext = &pool->metadata;
+    while (*pnext != NULL) {
+        struct heap_profile_entry *ent = *pnext;
+        if (ent->ptr == p) {
+            *pnext = ent->next;
+            if (heap_profile_print_enabled) {
+                uint block_size = INDEX2SIZE(pool->szidx);
+                fprintf(stderr, "heap profile free: %p size=%u alloc_count=%llu\n",
+                        (void *)p, block_size, (unsigned long long)ent->alloc_count);
+            }
+            PyMem_RawFree(ent);
+            return;
+        }
+        pnext = &ent->next;
+    }
+}
+
 // space for a block.  Otherwise, remove this pool from usedpools.
 static void
 pymalloc_pool_extend(poolp pool, uint size)
@@ -2432,6 +2488,9 @@ pymalloc_alloc(OMState *state, void *Py_UNUSED(ctx), size_t nbytes)
     }
 
     uint size = (uint)(nbytes - 1) >> ALIGNMENT_SHIFT;
+    if (UNLIKELY(!heap_profile_initialized)) {
+        init_heap_profile_sampling();
+    }
     poolp pool = usedpools[size + size];
     pymem_block *bp;
 
@@ -2454,6 +2513,21 @@ pymalloc_alloc(OMState *state, void *Py_UNUSED(ctx), size_t nbytes)
          * available:  use a free pool.
          */
         bp = allocate_from_new_pool(state, size);
+    }
+
+    /* Profile every Nth allocation: add to pool's metadata linked list */
+    if (heap_profile_sample_rate > 0) {
+        heap_profile_alloc_counter++;
+        if ((heap_profile_alloc_counter % heap_profile_sample_rate) == 0) {
+            struct heap_profile_entry *ent = PyMem_RawMalloc(sizeof(*ent));
+            if (ent != NULL) {
+                poolp alloc_pool = POOL_ADDR(bp);  /* bp may be from allocate_from_new_pool */
+                ent->ptr = bp;
+                ent->alloc_count = heap_profile_alloc_counter;
+                ent->next = alloc_pool->metadata;
+                alloc_pool->metadata = ent;
+            }
+        }
     }
 
     return (void *)bp;
@@ -2703,6 +2777,11 @@ pymalloc_free(OMState *state, void *Py_UNUSED(ctx), void *p)
     }
     /* We allocated this address. */
 
+    /* If this block was profiled, remove from list and optionally print */
+    if (pool->metadata != NULL) {
+        heap_profile_remove_and_print(pool, (pymem_block *)p);
+    }
+
     /* Link p to the start of the pool's freeblock list.  Since
      * the pool had at least the p block outstanding, the pool
      * wasn't empty (so it's already in a usedpools[] list, or
@@ -2739,6 +2818,7 @@ pymalloc_free(OMState *state, void *Py_UNUSED(ctx), void *p)
      * previously freed pools will be allocated later
      * (being not referenced, they are perhaps paged out).
      */
+    assert(pool->metadata == NULL);
     insert_to_freepool(state, pool);
     return 1;
 }

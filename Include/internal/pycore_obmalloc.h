@@ -267,6 +267,8 @@ _Static_assert(sizeof(struct {
 }) == sizeof(pymem_block *),
                "pool_header_ref must fit in pointer-sized space");
 
+struct heap_profile_entry;
+
 /* Pool for small blocks. */
 struct pool_header {
     union {
@@ -280,7 +282,7 @@ struct pool_header {
     pymem_block *freeblock;          /* pool's free list head         */
     struct pool_header *nextpool;    /* see "Pool table" for meaning  */
     struct pool_header *prevpool;    /* "                             */
-    void* metadata;                  /* pool metadata                  */
+    struct heap_profile_entry *metadata;  /* heap profile list (when profiling) */
     uint arenaindex;                 /* index into arenas of base adr */
     uint16_t nextoffset;             /* bytes to virgin block         */
     uint16_t maxnextoffset;          /* largest valid nextoffset      */
