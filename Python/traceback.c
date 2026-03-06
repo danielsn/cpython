@@ -983,6 +983,130 @@ done:
     }
 }
 
+/* Write a Unicode object to a buffer as ASCII (backslashreplace). Signal safe.
+   Returns the number of chars written (excluding null). Always null-terminates. */
+static Py_ssize_t _Py_NO_SANITIZE_THREAD
+dump_ascii_to_buffer(char *buf, size_t buf_size, PyObject *text)
+{
+    if (buf_size == 0)
+        return 0;
+    buf[0] = '\0';
+
+    if (!PyUnicode_Check(text))
+        goto invalid;
+
+    PyASCIIObject *ascii = _PyASCIIObject_CAST(text);
+    Py_ssize_t i, size;
+    int truncated;
+    int kind;
+    void *data = NULL;
+    Py_UCS4 ch;
+    char *out = buf;
+    char *end = buf + buf_size - 1;  /* leave room for null */
+
+    size = ascii->length;
+    kind = ascii->state.kind;
+    if (ascii->state.compact) {
+        if (ascii->state.ascii)
+            data = ascii + 1;
+        else
+            data = _PyCompactUnicodeObject_CAST(text) + 1;
+    }
+    else {
+        data = _PyUnicodeObject_CAST(text)->data.any;
+        if (data == NULL)
+            goto invalid;
+    }
+
+    if (MAX_STRING_LENGTH < size) {
+        size = MAX_STRING_LENGTH;
+        truncated = 1;
+    }
+    else {
+        truncated = 0;
+    }
+
+    /* Fast path: pure ASCII, no escaping needed */
+    if (ascii->state.ascii) {
+        assert(kind == PyUnicode_1BYTE_KIND);
+        char *str = data;
+        for (i = 0; i < size && out < end; i++) {
+            ch = str[i];
+            if (!(' ' <= ch && ch <= 126))
+                break;
+            *out++ = (char)ch;
+        }
+        if (i == size) {
+            if (truncated && out + 3 <= end) {
+                *out++ = '.';
+                *out++ = '.';
+                *out++ = '.';
+            }
+            *out = '\0';
+            return out - buf;
+        }
+        /* Need to escape; fall through to slow path from start */
+        out = buf;
+    }
+
+    /* Slow path: escape non-printable chars */
+    for (i = 0; i < size && out < end; i++) {
+        ch = PyUnicode_READ(kind, data, i);
+        if (' ' <= ch && ch <= 126) {
+            *out++ = (char)ch;
+        }
+        else if (ch <= 0xff) {
+            if (out + 4 <= end) {
+                *out++ = '\\';
+                *out++ = 'x';
+                *out++ = Py_hexdigits[(ch >> 4) & 15];
+                *out++ = Py_hexdigits[ch & 15];
+            }
+        }
+        else if (ch <= 0xffff) {
+            if (out + 6 <= end) {
+                *out++ = '\\';
+                *out++ = 'u';
+                *out++ = Py_hexdigits[(ch >> 12) & 15];
+                *out++ = Py_hexdigits[(ch >> 8) & 15];
+                *out++ = Py_hexdigits[(ch >> 4) & 15];
+                *out++ = Py_hexdigits[ch & 15];
+            }
+        }
+        else {
+            if (out + 10 <= end) {
+                *out++ = '\\';
+                *out++ = 'U';
+                *out++ = Py_hexdigits[(ch >> 28) & 15];
+                *out++ = Py_hexdigits[(ch >> 24) & 15];
+                *out++ = Py_hexdigits[(ch >> 20) & 15];
+                *out++ = Py_hexdigits[(ch >> 16) & 15];
+                *out++ = Py_hexdigits[(ch >> 12) & 15];
+                *out++ = Py_hexdigits[(ch >> 8) & 15];
+                *out++ = Py_hexdigits[(ch >> 4) & 15];
+                *out++ = Py_hexdigits[ch & 15];
+            }
+        }
+    }
+    if (truncated && out + 3 <= end) {
+        *out++ = '.';
+        *out++ = '.';
+        *out++ = '.';
+    }
+    *out = '\0';
+    return out - buf;
+
+invalid:
+    if (buf_size >= 4) {
+        buf[0] = '?';
+        buf[1] = '?';
+        buf[2] = '?';
+        buf[3] = '\0';
+        return 3;
+    }
+    return 0;
+}
+
 
 #ifdef MS_WINDOWS
 static void
@@ -1171,6 +1295,98 @@ void
 _Py_DumpTraceback(int fd, PyThreadState *tstate)
 {
     dump_traceback(fd, tstate, 1);
+}
+
+/* Fill a single frame struct from an interpreter frame. Signal safe.
+   Return 0 on success, -1 if frame should be skipped, -2 if invalid. */
+static int _Py_NO_SANITIZE_THREAD
+fill_frame_struct(PyTracebackFrameInfo *out, _PyInterpreterFrame *frame)
+{
+    if (frame->owner == FRAME_OWNED_BY_INTERPRETER) {
+        return -1;  /* skip trampoline/sentinel frames */
+    }
+
+    PyCodeObject *code = _PyFrame_SafeGetCode(frame);
+    if (code == NULL) {
+        return -2;
+    }
+
+    if (code->co_filename != NULL && PyUnicode_Check(code->co_filename)) {
+        dump_ascii_to_buffer(out->filename, Py_TRACEBACK_FRAME_FILENAME_MAX,
+                            code->co_filename);
+    }
+    else {
+        if (Py_TRACEBACK_FRAME_FILENAME_MAX >= 4) {
+            out->filename[0] = '?';
+            out->filename[1] = '?';
+            out->filename[2] = '?';
+            out->filename[3] = '\0';
+        }
+    }
+
+    int lasti = _PyFrame_SafeGetLasti(frame);
+    int lineno = -1;
+    if (lasti >= 0) {
+        lineno = _PyCode_SafeAddr2Line(code, lasti);
+    }
+    out->lineno = lineno >= 0 ? lineno : 0;
+
+    if (code->co_name != NULL && PyUnicode_Check(code->co_name)) {
+        dump_ascii_to_buffer(out->name, Py_TRACEBACK_FRAME_NAME_MAX,
+                            code->co_name);
+    }
+    else {
+        if (Py_TRACEBACK_FRAME_NAME_MAX >= 4) {
+            out->name[0] = '?';
+            out->name[1] = '?';
+            out->name[2] = '?';
+            out->name[3] = '\0';
+        }
+    }
+
+    return 0;
+}
+
+int
+_Py_GetTracebackFrames(PyThreadState *tstate, PyTracebackFrameInfo *frames,
+                      int max_frames)
+{
+    if (max_frames <= 0 || frames == NULL) {
+        return 0;
+    }
+    if (tstate_is_freed(tstate)) {
+        return -1;
+    }
+
+    _PyInterpreterFrame *frame = tstate->current_frame;
+    if (frame == NULL) {
+        return 0;
+    }
+
+    int count = 0;
+    while (count < max_frames) {
+        if (_PyMem_IsPtrFreed(frame)) {
+            break;
+        }
+        _PyInterpreterFrame *previous = frame->previous;
+
+        int res = fill_frame_struct(&frames[count], frame);
+        if (res == 0) {
+            count++;
+        }
+        else if (res == -2) {
+            /* invalid frame, stop */
+            break;
+        }
+        /* res == -1: skip this frame, continue */
+
+        frame = previous;
+        if (frame == NULL) {
+            break;
+        }
+    }
+
+    return count;
 }
 
 #if defined(HAVE_PTHREAD_GETNAME_NP) || defined(HAVE_PTHREAD_GET_NAME_NP)
