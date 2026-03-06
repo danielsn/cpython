@@ -103,6 +103,11 @@ extern int _Py_WriteIndent(int, PyObject *);
 PyAPI_FUNC(void) _Py_InitDumpStack(void);
 PyAPI_FUNC(void) _Py_DumpStack(int fd);
 
+/* Capture C stack into buffer (up to size frames). Returns count, or 0 if unsupported. */
+PyAPI_FUNC(int) _Py_GetBacktrace(void **buffer, int size);
+/* Dump a previously captured backtrace array to fd. */
+PyAPI_FUNC(void) _Py_DumpBacktraceFromArray(int fd, void *const *array, int size);
+
 extern void _Py_DumpTraceback_Init(void);
 
 /* Traceback frame info for signal-safe collection.

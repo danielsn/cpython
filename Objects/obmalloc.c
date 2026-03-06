@@ -2257,12 +2257,26 @@ address_in_range(OMState *state, void *p, poolp pool)
  * Allocation tracebacks are interned via _Py_traceback_intern (dedup by string/frame/traceback).
  */
 #define HEAP_PROFILE_TRACEBACK_MAX 8
+#define HEAP_PROFILE_NATIVE_BT_MAX 12
+
+/* Reason for missing traceback (when traceback_id is NULL). Helps debugging. */
+enum heap_profile_traceback_reason {
+    HEAP_PROFILE_TB_OK = 0,           /* have traceback */
+    HEAP_PROFILE_TB_NO_TABLE,         /* interning table not created */
+    HEAP_PROFILE_TB_NO_TSTATE,        /* no PyThreadState (e.g. C-only context) */
+    HEAP_PROFILE_TB_NO_FRAMES,        /* no Python frames on stack */
+    HEAP_PROFILE_TB_INTERN_FAILED,    /* _Py_traceback_intern returned NULL */
+};
 
 struct heap_profile_entry {
     pymem_block *ptr;
     uint64_t alloc_count;
     size_t size;
     Py_traceback_id_t traceback_id;  /* interned; NULL if none */
+    unsigned char traceback_reason;   /* enum above; meaningful when traceback_id==NULL */
+    /* Native C backtrace when no Python frames (traceback_id==NULL). */
+    void *native_bt[HEAP_PROFILE_NATIVE_BT_MAX];
+    int native_bt_count;              /* 0 = no native backtrace captured */
     struct heap_profile_entry *next;       /* per-pool list (pool->metadata) */
     struct heap_profile_entry *global_next;
     struct heap_profile_entry *global_prev;
@@ -2299,20 +2313,43 @@ static void
 heap_profile_collect_traceback(struct heap_profile_entry *ent)
 {
     ent->traceback_id = NULL;
+    ent->traceback_reason = HEAP_PROFILE_TB_NO_TABLE;
+    ent->native_bt_count = 0;
     if (heap_profile_interning_table == NULL) {
         return;
     }
+    ent->traceback_reason = HEAP_PROFILE_TB_NO_TSTATE;
     PyThreadState *tstate = _PyThreadState_GET();
     if (tstate == NULL) {
+        ent->native_bt_count = _Py_GetBacktrace(ent->native_bt,
+                                                HEAP_PROFILE_NATIVE_BT_MAX);
         return;
     }
     PyTracebackFrameInfo frames[HEAP_PROFILE_TRACEBACK_MAX];
     int count = _Py_GetTracebackFrames(tstate, frames, HEAP_PROFILE_TRACEBACK_MAX);
+    ent->traceback_reason = HEAP_PROFILE_TB_NO_FRAMES;
     if (count > 0) {
         ent->traceback_id = _Py_traceback_intern(frames, count,
                                                  heap_profile_interning_table);
+        if (ent->traceback_id != NULL) {
+            ent->traceback_reason = HEAP_PROFILE_TB_OK;
+        } else {
+            ent->traceback_reason = HEAP_PROFILE_TB_INTERN_FAILED;
+        }
+    } else {
+        /* No Python frames - capture native C backtrace for debugging */
+        ent->native_bt_count = _Py_GetBacktrace(ent->native_bt,
+                                                 HEAP_PROFILE_NATIVE_BT_MAX);
     }
 }
+
+static const char *heap_profile_traceback_reason_str[] = {
+    [HEAP_PROFILE_TB_OK] = "ok",
+    [HEAP_PROFILE_TB_NO_TABLE] = "no interning table",
+    [HEAP_PROFILE_TB_NO_TSTATE] = "no thread state (C-only context?)",
+    [HEAP_PROFILE_TB_NO_FRAMES] = "no Python frames on stack",
+    [HEAP_PROFILE_TB_INTERN_FAILED] = "traceback interning failed",
+};
 
 static void
 heap_profile_dump_traceback(struct heap_profile_entry *ent)
@@ -2321,7 +2358,14 @@ heap_profile_dump_traceback(struct heap_profile_entry *ent)
         _Py_traceback_dump_id(ent->traceback_id, heap_profile_interning_table,
                               fileno(stderr));
     } else {
-        fprintf(stderr, "  no traceback\n");
+        unsigned char r = ent->traceback_reason;
+        const char *reason = (r <= HEAP_PROFILE_TB_INTERN_FAILED)
+            ? heap_profile_traceback_reason_str[r] : "unknown";
+        fprintf(stderr, "  no Python traceback (%s)\n", reason);
+        if (ent->native_bt_count > 0) {
+            _Py_DumpBacktraceFromArray(fileno(stderr), ent->native_bt,
+                                        ent->native_bt_count);
+        }
     }
 }
 

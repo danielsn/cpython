@@ -1652,12 +1652,50 @@ _Py_DumpStack(int fd)
 
 #undef BACKTRACE_SIZE
 }
+
+/* Fill buffer with up to size return addresses. Returns number captured. */
+int
+_Py_GetBacktrace(void **buffer, int size)
+{
+    if (buffer == NULL || size <= 0) {
+        return 0;
+    }
+    int frames = backtrace(buffer, size);
+    return (frames > 0) ? frames : 0;
+}
+
+/* Dump a previously captured backtrace array to fd. */
+void
+_Py_DumpBacktraceFromArray(int fd, void *const *array, int size)
+{
+    if (array == NULL || size <= 0) {
+        return;
+    }
+    PUTS(fd, "  C stack (most recent call first):\n");
+    _Py_backtrace_symbols_fd(fd, array, size);
+}
 #else
 void
 _Py_DumpStack(int fd)
 {
     PUTS(fd, "Current thread's C stack trace (most recent call first):\n");
     PUTS(fd, "  <cannot get C stack on this system>\n");
+}
+
+int
+_Py_GetBacktrace(void **buffer, int size)
+{
+    (void)buffer;
+    (void)size;
+    return 0;
+}
+
+void
+_Py_DumpBacktraceFromArray(int fd, void *const *array, int size)
+{
+    (void)fd;
+    (void)array;
+    (void)size;
 }
 #endif
 
