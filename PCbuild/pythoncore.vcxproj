@@ -555,6 +555,7 @@
     <ClCompile Include="..\Objects\object.c" />
     <ClCompile Include="..\Objects\obmalloc.c" />
     <ClCompile Include="..\Objects\heap_profile.c" />
+    <ClCompile Include="..\Objects\heap_profile_export.c" />
     <ClCompile Include="..\Objects\odictobject.c" />
     <ClCompile Include="..\Objects\picklebufobject.c" />
     <ClCompile Include="..\Objects\rangeobject.c" />

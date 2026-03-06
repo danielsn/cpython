@@ -37,6 +37,7 @@
 #include "pycore_pylifecycle.h"   // _PyInterpreterConfig_InitFromDict()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
 #include "pycore_traceback.h"     // _Py_GetTracebackFrames()
+#include "pycore_heap_profile.h"  // heap_profile_get_first, etc.
 #include "pycore_runtime_structs.h" // _PY_NSMALLPOSINTS
 #include "pycore_unicodeobject.h" // _PyUnicode_TransformDecimalAndSpaceToASCII()
 
@@ -1762,6 +1763,197 @@ get_traceback_frames(PyObject *self, PyObject *Py_UNUSED(args))
     return result;
 }
 
+// Iterate over heap profile entries. Returns list of (ptr, size, alloc_count,
+// bytes_since_last_sample, allocs_since_last_sample, traceback_frames).
+// traceback_frames is list of (filename, lineno, name) or None if no traceback.
+static PyObject *
+heap_profile_iterate(PyObject *self, PyObject *Py_UNUSED(args))
+{
+    if (!heap_profile_is_enabled()) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "heap profiling not enabled; set PYTHON_HEAP_PROFILE_SAMPLE_BYTES");
+        return NULL;
+    }
+
+    PyObject *result = PyList_New(0);
+    if (result == NULL) {
+        return NULL;
+    }
+
+    Py_traceback_interning_table_t *table = heap_profile_get_interning_table();
+    PyTracebackFrameInfo frames[HEAP_PROFILE_TRACEBACK_MAX];
+
+    for (struct heap_profile_entry *ent = heap_profile_get_first(); ent != NULL;
+         ent = heap_profile_get_next(ent)) {
+        PyObject *ptr_obj = (ent->ptr != NULL)
+            ? PyLong_FromVoidPtr((void *)ent->ptr)
+            : Py_None;
+        if (ptr_obj == NULL) {
+            Py_DECREF(result);
+            return NULL;
+        }
+        if (ptr_obj == Py_None) {
+            Py_INCREF(Py_None);
+        }
+
+        PyObject *tb_frames = Py_None;
+        if (ent->traceback_id != NULL && table != NULL) {
+            int n = _Py_traceback_fill_frames(ent->traceback_id, table,
+                                             frames, HEAP_PROFILE_TRACEBACK_MAX);
+            if (n > 0) {
+                tb_frames = PyList_New(n);
+                if (tb_frames == NULL) {
+                    Py_DECREF(ptr_obj);
+                    Py_DECREF(result);
+                    return NULL;
+                }
+                for (int i = 0; i < n; i++) {
+                    PyObject *t = Py_BuildValue("(sis)", frames[i].filename,
+                                                frames[i].lineno,
+                                                frames[i].name);
+                    if (t == NULL) {
+                        Py_DECREF(tb_frames);
+                        Py_DECREF(ptr_obj);
+                        Py_DECREF(result);
+                        return NULL;
+                    }
+                    PyList_SET_ITEM(tb_frames, i, t);
+                }
+            }
+        }
+        PyObject *size_obj = PyLong_FromSize_t(ent->size);
+        PyObject *alloc_count_obj = PyLong_FromUnsignedLongLong(
+            (unsigned long long)ent->alloc_count);
+        PyObject *bytes_obj = PyLong_FromUnsignedLongLong(
+            (unsigned long long)ent->bytes_since_last_sample);
+        PyObject *allocs_obj = PyLong_FromUnsignedLongLong(
+            (unsigned long long)ent->allocs_since_last_sample);
+        if (size_obj == NULL || alloc_count_obj == NULL || bytes_obj == NULL
+            || allocs_obj == NULL) {
+            Py_DECREF(ptr_obj);
+            Py_XDECREF(size_obj);
+            Py_XDECREF(alloc_count_obj);
+            Py_XDECREF(bytes_obj);
+            Py_XDECREF(allocs_obj);
+            if (tb_frames != Py_None) {
+                Py_DECREF(tb_frames);
+            }
+            Py_DECREF(result);
+            return NULL;
+        }
+        PyObject *item = Py_BuildValue("OOOOOO", ptr_obj, size_obj,
+            alloc_count_obj, bytes_obj, allocs_obj, tb_frames);
+        Py_DECREF(ptr_obj);
+        Py_DECREF(size_obj);
+        Py_DECREF(alloc_count_obj);
+        Py_DECREF(bytes_obj);
+        Py_DECREF(allocs_obj);
+        if (tb_frames != Py_None) {
+            Py_DECREF(tb_frames);
+        }
+        if (item == NULL) {
+            Py_DECREF(result);
+            return NULL;
+        }
+        if (PyList_Append(result, item) < 0) {
+            Py_DECREF(item);
+            Py_DECREF(result);
+            return NULL;
+        }
+        Py_DECREF(item);
+    }
+    return result;
+}
+
+/* Export heap profile to pprof/OTel format, return as bytes. For testing. */
+static PyObject *
+heap_profile_export_pprof_bytes(PyObject *self, PyObject *Py_UNUSED(args))
+{
+    if (!heap_profile_is_enabled()) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "heap profiling not enabled; set PYTHON_HEAP_PROFILE_SAMPLE_BYTES");
+        return NULL;
+    }
+    FILE *f = tmpfile();
+    if (f == NULL) {
+        PyErr_SetFromErrno(PyExc_OSError);
+        return NULL;
+    }
+    if (heap_profile_export_pprof(f) < 0) {
+        fclose(f);
+        PyErr_SetString(PyExc_RuntimeError, "heap_profile_export_pprof failed");
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_END) < 0) {
+        fclose(f);
+        return NULL;
+    }
+    long size = ftell(f);
+    if (size < 0) {
+        fclose(f);
+        return NULL;
+    }
+    rewind(f);
+    PyObject *result = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)size);
+    if (result == NULL) {
+        fclose(f);
+        return NULL;
+    }
+    char *buf = PyBytes_AS_STRING(result);
+    size_t n = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    if (n != (size_t)size) {
+        Py_DECREF(result);
+        PyErr_SetString(PyExc_IOError, "failed to read exported profile");
+        return NULL;
+    }
+    return result;
+}
+
+static PyObject *
+heap_profile_export_otel_bytes(PyObject *self, PyObject *Py_UNUSED(args))
+{
+    if (!heap_profile_is_enabled()) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "heap profiling not enabled; set PYTHON_HEAP_PROFILE_SAMPLE_BYTES");
+        return NULL;
+    }
+    FILE *f = tmpfile();
+    if (f == NULL) {
+        PyErr_SetFromErrno(PyExc_OSError);
+        return NULL;
+    }
+    if (heap_profile_export_otel(f) < 0) {
+        fclose(f);
+        PyErr_SetString(PyExc_RuntimeError, "heap_profile_export_otel failed");
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_END) < 0) {
+        fclose(f);
+        return NULL;
+    }
+    long size = ftell(f);
+    if (size < 0) {
+        fclose(f);
+        return NULL;
+    }
+    rewind(f);
+    PyObject *result = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)size);
+    if (result == NULL) {
+        fclose(f);
+        return NULL;
+    }
+    char *buf = PyBytes_AS_STRING(result);
+    size_t n = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    if (n != (size_t)size) {
+        Py_DECREF(result);
+        PyErr_SetString(PyExc_IOError, "failed to read exported profile");
+        return NULL;
+    }
+    return result;
+}
+
 // Test traceback interning: intern traceback -> traceback_id (dedup by string/frame/traceback)
 static PyObject *
 traceback_intern_test(PyObject *self, PyObject *Py_UNUSED(args))
@@ -2973,6 +3165,14 @@ static PyMethodDef module_functions[] = {
      "Get current traceback as list of (filename, lineno, name) tuples (signal-safe API)"},
     {"traceback_intern_test", traceback_intern_test, METH_NOARGS,
      "Test traceback interning: returns (traceback_id, same_id_on_reintern)"},
+    {"heap_profile_iterate", heap_profile_iterate, METH_NOARGS,
+     "Iterate over heap profile entries. Returns list of (ptr, size, alloc_count, "
+     "bytes_since_last_sample, allocs_since_last_sample, traceback_frames). "
+     "Requires PYTHON_HEAP_PROFILE_SAMPLE_BYTES to be set."},
+    {"heap_profile_export_pprof_bytes", heap_profile_export_pprof_bytes, METH_NOARGS,
+     "Export heap profile to pprof protobuf. Returns bytes. Requires heap profiling enabled."},
+    {"heap_profile_export_otel_bytes", heap_profile_export_otel_bytes, METH_NOARGS,
+     "Export heap profile to OTel protobuf. Returns bytes. Requires heap profiling enabled."},
     {"test_tstate_capi", test_tstate_capi, METH_NOARGS, NULL},
     {"_PyUnicode_TransformDecimalAndSpaceToASCII", unicode_transformdecimalandspacetoascii, METH_O},
     {"check_pyobject_forbidden_bytes_is_freed",

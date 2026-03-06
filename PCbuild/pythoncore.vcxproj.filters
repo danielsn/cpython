@@ -1268,6 +1268,9 @@
     <ClCompile Include="..\Objects\heap_profile.c">
       <Filter>Objects</Filter>
     </ClCompile>
+    <ClCompile Include="..\Objects\heap_profile_export.c">
+      <Filter>Objects</Filter>
+    </ClCompile>
     <ClCompile Include="..\Objects\picklebufobject.c">
       <Filter>Objects</Filter>
     </ClCompile>

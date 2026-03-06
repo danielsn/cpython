@@ -1753,14 +1753,19 @@ struct _Py_traceback_interned_string {
     char *str;
     size_t len;
     int refcount;
+    int64_t export_index;  /* scratch: pprof/otel string table index, -1 when unset */
 };
 typedef struct _Py_traceback_interned_string interned_string_t;
+
+#define TB_EXPORT_INDEX_UNSET ((uint32_t)-1)
 
 struct _Py_traceback_interned_frame {
     Py_traceback_string_id_t filename_id;
     int lineno;
     Py_traceback_string_id_t name_id;
     int refcount;
+    uint32_t export_function_index;  /* scratch: OTel function table index */
+    uint32_t export_location_index;  /* scratch: OTel location table index */
 };
 typedef struct _Py_traceback_interned_frame interned_frame_t;
 
@@ -1939,6 +1944,7 @@ tb_intern_string(const char *str, size_t len,
     ent->str[len] = '\0';
     ent->len = len;
     ent->refcount = 1;
+    ent->export_index = -1;
 
     if (_Py_hashtable_set(table->strings, ent, ent) < 0) {
         table->free(ent->str);
@@ -1974,6 +1980,8 @@ tb_intern_frame(Py_traceback_string_id_t filename_id,
     ent->lineno = lineno;
     ent->name_id = name_id;
     ent->refcount = 1;
+    ent->export_function_index = TB_EXPORT_INDEX_UNSET;
+    ent->export_location_index = TB_EXPORT_INDEX_UNSET;
 
     if (filename_id) {
         ((interned_string_t *)filename_id)->refcount++;
@@ -2191,13 +2199,9 @@ _Py_traceback_fill_frames(Py_traceback_id_t traceback_id,
         return 0;
     }
     interned_traceback_t *tb = (interned_traceback_t *)traceback_id;
-    if (tb->frame_count <= 0) {
-        return 0;
-    }
     int count = tb->frame_count;
-    if (count > max_frames) {
-        count = max_frames;
-    }
+    if (count <= 0) return 0;
+    if (count > max_frames) count = max_frames;
     for (int i = 0; i < count; i++) {
         interned_frame_t *f = (interned_frame_t *)tb->frame_ids[i];
         const char *filename = f->filename_id
@@ -2214,6 +2218,182 @@ _Py_traceback_fill_frames(Py_traceback_id_t traceback_id,
         frames[i].name[Py_TRACEBACK_FRAME_NAME_MAX - 1] = '\0';
     }
     return count;
+}
+
+int
+_Py_traceback_fill_frames_with_string_ids(Py_traceback_id_t traceback_id,
+                                          Py_traceback_interning_table_t *table,
+                                          PyTracebackFrameInfoWithIds *frames,
+                                          int max_frames)
+{
+    if (traceback_id == NULL || table == NULL || frames == NULL || max_frames <= 0) {
+        return 0;
+    }
+    interned_traceback_t *tb = (interned_traceback_t *)traceback_id;
+    int count = tb->frame_count;
+    if (count <= 0) return 0;
+    if (count > max_frames) count = max_frames;
+    for (int i = 0; i < count; i++) {
+        interned_frame_t *f = (interned_frame_t *)tb->frame_ids[i];
+        frames[i].filename_id = f->filename_id;
+        frames[i].name_id = f->name_id;
+        frames[i].lineno = f->lineno;
+    }
+    return count;
+}
+
+int
+_Py_traceback_fill_frame_ids(Py_traceback_id_t traceback_id,
+                             Py_traceback_interning_table_t *table,
+                             Py_traceback_frame_id_t *frame_ids,
+                             int max_frames)
+{
+    if (traceback_id == NULL || table == NULL || frame_ids == NULL || max_frames <= 0) {
+        return 0;
+    }
+    interned_traceback_t *tb = (interned_traceback_t *)traceback_id;
+    int count = tb->frame_count;
+    if (count <= 0) return 0;
+    if (count > max_frames) count = max_frames;
+    memcpy(frame_ids, tb->frame_ids, (size_t)count * sizeof(Py_traceback_frame_id_t));
+    return count;
+}
+
+const char *
+_Py_traceback_string_id_get_str(Py_traceback_string_id_t string_id)
+{
+    assert(string_id != NULL);
+    return ((interned_string_t *)string_id)->str;
+}
+
+struct build_export_ctx {
+    void *ctx;
+    _Py_traceback_export_add_string_fn add_fn;
+};
+
+static int
+tb_build_export_string_cb(_Py_hashtable_t *ht, const void *key, const void *value,
+                          void *user_data)
+{
+    struct build_export_ctx *bc = (struct build_export_ctx *)user_data;
+    interned_string_t *ent = (interned_string_t *)value;
+    int64_t idx = bc->add_fn(bc->ctx, ent->str);
+    if (idx < 0) {
+        return -1;
+    }
+    ent->export_index = idx;
+    return 0;
+}
+
+int
+_Py_traceback_build_export_string_table(Py_traceback_interning_table_t *table,
+                                        void *ctx,
+                                        _Py_traceback_export_add_string_fn add_fn)
+{
+    struct build_export_ctx bc = { .ctx = ctx, .add_fn = add_fn };
+    return _Py_hashtable_foreach(table->strings, tb_build_export_string_cb, &bc);
+}
+
+int64_t
+_Py_traceback_string_id_get_export_index(Py_traceback_string_id_t string_id,
+                                        int64_t null_index)
+{
+    if (string_id == NULL) {
+        return null_index;
+    }
+    int64_t idx = ((interned_string_t *)string_id)->export_index;
+    assert(idx >= 0);
+    return idx;
+}
+
+static int
+tb_clear_export_index_cb(_Py_hashtable_t *ht, const void *key, const void *value,
+                         void *user_data)
+{
+    (void)ht;
+    (void)key;
+    (void)user_data;
+    ((interned_string_t *)value)->export_index = -1;
+    return 0;
+}
+
+void
+_Py_traceback_clear_export_indices(Py_traceback_interning_table_t *table)
+{
+    _Py_hashtable_foreach(table->strings, tb_clear_export_index_cb, NULL);
+}
+
+struct build_export_frame_ctx {
+    void *ctx;
+    _Py_traceback_export_add_frame_fn add_fn;
+    int64_t null_idx;
+};
+
+static int
+tb_build_export_frame_cb(_Py_hashtable_t *ht, const void *key, const void *value,
+                         void *user_data)
+{
+    struct build_export_frame_ctx *bc = (struct build_export_frame_ctx *)user_data;
+    interned_frame_t *ent = (interned_frame_t *)value;
+    int64_t filename_idx = _Py_traceback_string_id_get_export_index(ent->filename_id, bc->null_idx);
+    int64_t name_idx = _Py_traceback_string_id_get_export_index(ent->name_id, bc->null_idx);
+    int64_t result = bc->add_fn(bc->ctx, filename_idx, name_idx, ent->lineno);
+    if (result < 0) {
+        return -1;
+    }
+    ent->export_function_index = (uint32_t)(result >> 32);
+    ent->export_location_index = (uint32_t)(result & 0xFFFFFFFF);
+    return 0;
+}
+
+int
+_Py_traceback_build_export_frame_table(Py_traceback_interning_table_t *table,
+                                       void *ctx,
+                                       _Py_traceback_export_add_frame_fn add_fn,
+                                       int64_t null_idx)
+{
+    struct build_export_frame_ctx bc = {
+        .ctx = ctx,
+        .add_fn = add_fn,
+        .null_idx = null_idx,
+    };
+    return _Py_hashtable_foreach(table->frames, tb_build_export_frame_cb, &bc);
+}
+
+void
+_Py_traceback_frame_id_get_export_indices(Py_traceback_frame_id_t frame_id,
+                                          uint32_t *out_function_index,
+                                          uint32_t *out_location_index)
+{
+    if (frame_id == NULL) {
+        if (out_function_index) *out_function_index = 0;
+        if (out_location_index) *out_location_index = 0;
+        return;
+    }
+    interned_frame_t *f = (interned_frame_t *)frame_id;
+    assert(f->export_function_index != TB_EXPORT_INDEX_UNSET);
+    assert(f->export_location_index != TB_EXPORT_INDEX_UNSET);
+    if (out_function_index) *out_function_index = f->export_function_index;
+    if (out_location_index) *out_location_index = f->export_location_index;
+}
+
+static int
+tb_clear_export_frame_cb(_Py_hashtable_t *ht, const void *key, const void *value,
+                         void *user_data)
+{
+    (void)ht;
+    (void)key;
+    (void)user_data;
+    interned_frame_t *ent = (interned_frame_t *)value;
+    ent->export_function_index = TB_EXPORT_INDEX_UNSET;
+    ent->export_location_index = TB_EXPORT_INDEX_UNSET;
+    return 0;
+}
+
+void
+_Py_traceback_clear_export_frame_indices(Py_traceback_interning_table_t *table)
+{
+    _Py_hashtable_foreach(table->frames, tb_clear_export_frame_cb, NULL);
 }
 
 /* Foreach callback to free table entries (used when destroying table) */

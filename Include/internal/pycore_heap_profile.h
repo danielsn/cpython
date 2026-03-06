@@ -8,6 +8,8 @@ extern "C" {
 #  error "this header requires Py_BUILD_CORE define"
 #endif
 
+#include <stdio.h>
+
 #include "pycore_obmalloc.h"
 #include "pycore_traceback.h"
 
@@ -66,6 +68,26 @@ void heap_profile_free_large_block(void *p);
 
 /* Remove profiled block from pool's list and optionally print. */
 void heap_profile_remove_and_print(poolp pool, pymem_block *p);
+
+/* Iteration API for C extensions. Export for _testinternalcapi shared extension. */
+
+/* Return 1 if heap profiling is enabled and sampling, 0 otherwise. */
+PyAPI_FUNC(int) heap_profile_is_enabled(void);
+
+/* Get first/next entry in the global list. Returns NULL at end or when disabled.
+ * Safe to call; entries may be removed by other threads during iteration. */
+PyAPI_FUNC(struct heap_profile_entry *) heap_profile_get_first(void);
+PyAPI_FUNC(struct heap_profile_entry *) heap_profile_get_next(struct heap_profile_entry *ent);
+
+/* Get the interning table (for resolving traceback_id via _Py_traceback_fill_frames).
+ * Returns NULL if profiling disabled or table not created. */
+PyAPI_FUNC(Py_traceback_interning_table_t *) heap_profile_get_interning_table(void);
+
+/* Export heap profile to pprof format. Returns 0 on success, -1 on error. */
+PyAPI_FUNC(int) heap_profile_export_pprof(FILE *fp);
+
+/* Export heap profile to OTel format. Returns 0 on success, -1 on error. Stub: returns -1. */
+PyAPI_FUNC(int) heap_profile_export_otel(FILE *fp);
 
 #ifdef __cplusplus
 }

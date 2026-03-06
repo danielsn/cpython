@@ -273,3 +273,43 @@ heap_profile_remove_and_print(poolp pool, pymem_block *p)
         pnext = &ent->next;
     }
 }
+
+/* Iteration API. Export for shared extensions (e.g. _testinternalcapi). */
+#if defined(__GNUC__) || (defined(__clang__) && __has_attribute(visibility))
+#  define HEAP_PROFILE_EXPORT __attribute__((visibility("default")))
+#else
+#  define HEAP_PROFILE_EXPORT
+#endif
+
+HEAP_PROFILE_EXPORT int
+heap_profile_is_enabled(void)
+{
+    return heap_profiler.sample_interval_bytes > 0 && heap_profiler.initialized;
+}
+
+HEAP_PROFILE_EXPORT struct heap_profile_entry *
+heap_profile_get_first(void)
+{
+    if (!heap_profile_is_enabled()) {
+        return NULL;
+    }
+    return heap_profiler.list_head;
+}
+
+HEAP_PROFILE_EXPORT struct heap_profile_entry *
+heap_profile_get_next(struct heap_profile_entry *ent)
+{
+    if (ent == NULL) {
+        return NULL;
+    }
+    return ent->global_next;
+}
+
+HEAP_PROFILE_EXPORT Py_traceback_interning_table_t *
+heap_profile_get_interning_table(void)
+{
+    if (!heap_profile_is_enabled()) {
+        return NULL;
+    }
+    return heap_profiler.interning_table;
+}
