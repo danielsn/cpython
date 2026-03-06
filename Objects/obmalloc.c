@@ -10,6 +10,7 @@
 #include "pycore_pymem.h"
 #include "pycore_pystate.h"       // _PyInterpreterState_GET
 #include "pycore_stats.h"         // OBJECT_STAT_INC_COND()
+#include "pycore_traceback.h"     // _Py_GetTracebackFrames, PyTracebackFrameInfo
 
 #include <stdlib.h>               // malloc()
 #include <stdbool.h>
@@ -2250,15 +2251,19 @@ address_in_range(OMState *state, void *p, poolp pool)
 
 /*==========================================================================*/
 
-// Called when freelist is exhausted.  Extend the freelist if there is
 /* Heap profile: track 1 in N objects via linked list in pool->metadata.
  * PYTHON_HEAP_PROFILE_SAMPLE=N (default 10), PYTHON_HEAP_PROFILE_PRINT=1 to enable printing.
- * Entries are also in a global doubly-linked list (global_next/global_prev) for iteration.
+ * Entries are in a global doubly-linked list (global_next/global_prev) for iteration.
+ * Allocation tracebacks are collected via _Py_GetTracebackFrames when sampling.
  */
+#define HEAP_PROFILE_TRACEBACK_MAX 8
+
 struct heap_profile_entry {
     pymem_block *ptr;
     uint64_t alloc_count;
     size_t size;
+    PyTracebackFrameInfo traceback_frames[HEAP_PROFILE_TRACEBACK_MAX];
+    int traceback_count;
     struct heap_profile_entry *next;       /* per-pool list (pool->metadata) */
     struct heap_profile_entry *global_next;
     struct heap_profile_entry *global_prev;
@@ -2288,6 +2293,37 @@ heap_profile_global_remove(struct heap_profile_entry *ent)
     if (ent->global_next != NULL) {
         ent->global_next->global_prev = ent->global_prev;
     }
+}
+
+static void
+heap_profile_collect_traceback(struct heap_profile_entry *ent)
+{
+    PyThreadState *tstate = _PyThreadState_GET();
+    int count = (tstate != NULL)
+        ? _Py_GetTracebackFrames(tstate, ent->traceback_frames,
+                                 HEAP_PROFILE_TRACEBACK_MAX)
+        : 0;
+    ent->traceback_count = (count >= 0) ? count : 0;
+}
+
+static void
+heap_profile_dump_traceback(struct heap_profile_entry *ent)
+{
+    if (ent->traceback_count <= 0) {
+        return;
+    }
+    fprintf(stderr, "  Allocation traceback (most recent first):\n");
+    for (int i = 0; i < ent->traceback_count; i++) {
+        const PyTracebackFrameInfo *f = &ent->traceback_frames[i];
+        fprintf(stderr, "    File \"%s\", line %d in %s\n",
+                f->filename, f->lineno, f->name);
+    }
+}
+
+static void
+heap_profile_free_traceback(struct heap_profile_entry *ent)
+{
+    ent->traceback_count = 0;
 }
 
 /* Large allocation: always reserve one extra pointer before the object.
@@ -2328,7 +2364,9 @@ heap_profile_free_large_block(void *p)
         if (heap_profile_print_enabled) {
             fprintf(stderr, "heap profile free: %p size=%zu alloc_count=%llu\n",
                     p, ent->size, (unsigned long long)ent->alloc_count);
+            heap_profile_dump_traceback(ent);
         }
+        heap_profile_free_traceback(ent);
         PyMem_RawFree(metadata);
     }
     PyMem_RawFree(block);
@@ -2346,7 +2384,9 @@ heap_profile_remove_and_print(poolp pool, pymem_block *p)
             if (heap_profile_print_enabled) {
                 fprintf(stderr, "heap profile free: %p size=%zu alloc_count=%llu\n",
                     (void *)p, ent->size, (unsigned long long)ent->alloc_count);
+                heap_profile_dump_traceback(ent);
             }
+            heap_profile_free_traceback(ent);
             PyMem_RawFree(ent);
             return;
         }
@@ -2572,6 +2612,7 @@ pymalloc_alloc(OMState *state, void *Py_UNUSED(ctx), size_t nbytes)
                 ent->ptr = bp;
                 ent->alloc_count = heap_profile_alloc_counter;
                 ent->size = INDEX2SIZE(alloc_pool->szidx);
+                heap_profile_collect_traceback(ent);
                 ent->next = alloc_pool->metadata;
                 alloc_pool->metadata = ent;
                 heap_profile_global_insert(ent);
@@ -2612,6 +2653,7 @@ _PyObject_Malloc(void *ctx, size_t nbytes)
                 ent->ptr = NULL;  /* unused for large */
                 ent->alloc_count = heap_profile_alloc_counter;
                 ent->size = nbytes;
+                heap_profile_collect_traceback(ent);
                 ent->next = NULL;
                 heap_profile_global_insert(ent);
                 metadata = ent;
@@ -2656,6 +2698,7 @@ _PyObject_Calloc(void *ctx, size_t nelem, size_t elsize)
                 ent->ptr = NULL;  /* unused for large */
                 ent->alloc_count = heap_profile_alloc_counter;
                 ent->size = nbytes;
+                heap_profile_collect_traceback(ent);
                 ent->next = NULL;
                 heap_profile_global_insert(ent);
                 metadata = ent;

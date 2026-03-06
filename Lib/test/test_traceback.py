@@ -23,7 +23,7 @@ from test.support import (Error, captured_output, cpython_only, ALWAYS_EQ,
                           requires_subprocess, os_helper)
 from test.support.os_helper import TESTFN, temp_dir, unlink
 from test.support.script_helper import assert_python_ok, assert_python_failure, make_script
-from test.support.import_helper import forget
+from test.support.import_helper import forget, import_module
 from test.support import force_not_colorized, force_not_colorized_test_class
 
 import json
@@ -1987,6 +1987,33 @@ class TracebackFormatMixin:
             '  File "%s", line %d, in prn' % (__file__, lineno+1),
             '    traceback.print_stack()',
         ])
+
+    @cpython_only
+    def test_get_traceback_frames(self):
+        """Test _Py_GetTracebackFrames via _testinternalcapi.get_traceback_frames."""
+        _testinternalcapi = import_module("_testinternalcapi")
+        if not hasattr(_testinternalcapi, "get_traceback_frames"):
+            self.skipTest("requires _testinternalcapi.get_traceback_frames")
+
+        def inner():
+            return _testinternalcapi.get_traceback_frames()
+
+        def outer():
+            return inner()
+
+        frames = outer()
+        self.assertIsInstance(frames, list)
+        self.assertGreaterEqual(len(frames), 3)
+        for frame in frames:
+            self.assertIsInstance(frame, tuple)
+            self.assertEqual(len(frame), 3)
+            filename, lineno, name = frame
+            self.assertIsInstance(filename, str)
+            self.assertIsInstance(lineno, int)
+            self.assertIsInstance(name, str)
+        self.assertEqual(frames[0][2], "inner")
+        self.assertEqual(frames[1][2], "outer")
+        self.assertIn("test_get_traceback_frames", frames[2][2])
 
     # issue 26823 - Shrink recursive tracebacks
     def _check_recursive_traceback_display(self, render_exc):

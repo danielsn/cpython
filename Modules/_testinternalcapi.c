@@ -36,6 +36,7 @@
 #include "pycore_pyerrors.h"      // _PyErr_ChainExceptions1()
 #include "pycore_pylifecycle.h"   // _PyInterpreterConfig_InitFromDict()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
+#include "pycore_traceback.h"     // _Py_GetTracebackFrames()
 #include "pycore_runtime_structs.h" // _PY_NSMALLPOSINTS
 #include "pycore_unicodeobject.h" // _PyUnicode_TransformDecimalAndSpaceToASCII()
 
@@ -1729,6 +1730,38 @@ tracemalloc_get_traceback(PyObject *self, PyObject *args)
 }
 
 
+// Test _Py_GetTracebackFrames() - signal-safe traceback collection
+static PyObject *
+get_traceback_frames(PyObject *self, PyObject *Py_UNUSED(args))
+{
+    PyThreadState *tstate = PyThreadState_Get();
+    if (tstate == NULL) {
+        return NULL;
+    }
+
+    PyTracebackFrameInfo frames[32];
+    int count = _Py_GetTracebackFrames(tstate, frames, 32);
+    if (count < 0) {
+        PyErr_SetString(PyExc_RuntimeError, "invalid or freed thread state");
+        return NULL;
+    }
+
+    PyObject *result = PyList_New(count);
+    if (result == NULL) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        PyObject *t = Py_BuildValue("(sis)", frames[i].filename,
+                                    frames[i].lineno, frames[i].name);
+        if (t == NULL) {
+            Py_DECREF(result);
+            return NULL;
+        }
+        PyList_SET_ITEM(result, i, t);
+    }
+    return result;
+}
+
 // Test PyThreadState C API
 static PyObject *
 test_tstate_capi(PyObject *self, PyObject *Py_UNUSED(args))
@@ -2890,6 +2923,8 @@ static PyMethodDef module_functions[] = {
      METH_VARARGS | METH_KEYWORDS},
     {"pending_identify", pending_identify, METH_VARARGS, NULL},
     {"_PyTraceMalloc_GetTraceback", tracemalloc_get_traceback, METH_VARARGS},
+    {"get_traceback_frames", get_traceback_frames, METH_NOARGS,
+     "Get current traceback as list of (filename, lineno, name) tuples (signal-safe API)"},
     {"test_tstate_capi", test_tstate_capi, METH_NOARGS, NULL},
     {"_PyUnicode_TransformDecimalAndSpaceToASCII", unicode_transformdecimalandspacetoascii, METH_O},
     {"check_pyobject_forbidden_bytes_is_freed",

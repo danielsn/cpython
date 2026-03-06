@@ -105,6 +105,29 @@ PyAPI_FUNC(void) _Py_DumpStack(int fd);
 
 extern void _Py_DumpTraceback_Init(void);
 
+/* Traceback frame info for signal-safe collection.
+   This function is signal safe. */
+#define Py_TRACEBACK_FRAME_FILENAME_MAX 256
+#define Py_TRACEBACK_FRAME_NAME_MAX 256
+
+typedef struct {
+    char filename[Py_TRACEBACK_FRAME_FILENAME_MAX];
+    int lineno;
+    char name[Py_TRACEBACK_FRAME_NAME_MAX];
+} PyTracebackFrameInfo;
+
+/* Collect the traceback of a Python thread into an array of structs.
+   Caller provides the array and max_frames. Returns the number of frames
+   filled, or -1 if tstate is invalid/freed.
+
+   This function is signal safe. No memory allocations or GIL releases.
+
+   Export for _testinternalcapi. */
+PyAPI_FUNC(int) _Py_GetTracebackFrames(
+    PyThreadState *tstate,
+    PyTracebackFrameInfo *frames,
+    int max_frames);
+
 #ifdef __cplusplus
 }
 #endif

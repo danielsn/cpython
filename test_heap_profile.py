@@ -41,6 +41,26 @@ def run_with_profiling():
     return 0
 
 
+def run_with_traceback_test():
+    """Allocate from a call chain so tracebacks show multiple frames."""
+
+    def level3():
+        return [1, 2, 3] * 100  # Allocation happens here
+
+    def level2():
+        return level3()
+
+    def level1():
+        return level2()
+
+    for _ in range(30):
+        obj = level1()
+        del obj
+
+    gc.collect()
+    return 0
+
+
 def main():
     if "--check" in sys.argv:
         # Run self in subprocess with profiling, verify we get output
@@ -75,6 +95,29 @@ def main():
             print("Test failed: no large allocation tracking (size > 512)")
             return 1
 
+        # Run traceback test: allocations from Python code should have tracebacks
+        result2 = subprocess.run(
+            [sys.executable, "-c",
+             "from test_heap_profile import run_with_traceback_test; "
+             "run_with_traceback_test()"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if result2.returncode != 0:
+            print(f"Traceback test failed: exit code {result2.returncode}")
+            return 1
+        if "Allocation traceback" not in result2.stderr:
+            print("Test failed: no 'Allocation traceback' in output")
+            return 1
+        if 'File "' not in result2.stderr or " in " not in result2.stderr:
+            print("Test failed: traceback missing file/line info")
+            return 1
+        # Verify our call chain appears (level3 -> level2 -> level1)
+        if "level3" not in result2.stderr or "level2" not in result2.stderr:
+            print("Test failed: traceback missing expected call chain (level3/level2)")
+            return 1
+
         print("OK: heap profiling produced expected output")
         return 0
 
@@ -83,7 +126,10 @@ def main():
         print("Or: ./python.exe test_heap_profile.py --check")
         return 1
 
-    run_with_profiling()
+    if "--traceback" in sys.argv:
+        run_with_traceback_test()
+    else:
+        run_with_profiling()
     return 0
 
 
