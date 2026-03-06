@@ -128,6 +128,56 @@ PyAPI_FUNC(int) _Py_GetTracebackFrames(
     PyTracebackFrameInfo *frames,
     int max_frames);
 
+/* Traceback interning table: deduplicates strings, frames, and tracebacks
+   via reference-counted interning. Returns canonical IDs for each level. */
+
+typedef struct _Py_traceback_interning_table Py_traceback_interning_table_t;
+
+/* Opaque IDs (pointers to interned entries). Use for equality only. */
+struct _Py_traceback_interned_string;
+struct _Py_traceback_interned_frame;
+struct _Py_traceback_interned_traceback;
+typedef const struct _Py_traceback_interned_string *Py_traceback_string_id_t;
+typedef const struct _Py_traceback_interned_frame *Py_traceback_frame_id_t;
+typedef const struct _Py_traceback_interned_traceback *Py_traceback_id_t;
+
+/* Allocator for interning table (e.g. use RawMalloc when called from allocator). */
+typedef struct {
+    void *(*malloc)(size_t size);
+    void (*free)(void *ptr);
+} Py_traceback_interning_allocator_t;
+
+/* Create/destroy the interning table. allocator NULL = use PyMem_Malloc/Free. */
+PyAPI_FUNC(Py_traceback_interning_table_t *) _Py_traceback_interning_table_new(
+    const Py_traceback_interning_allocator_t *allocator);
+PyAPI_FUNC(void) _Py_traceback_interning_table_free(Py_traceback_interning_table_t *table);
+
+/* Dump traceback to fd (for heap profiler etc). */
+PyAPI_FUNC(void) _Py_traceback_dump_id(
+    Py_traceback_id_t traceback_id,
+    Py_traceback_interning_table_t *table,
+    int fd);
+
+/* Fill frames array from traceback_id. Caller provides array and max_frames.
+   Returns number of frames filled, or 0 if traceback_id is NULL or invalid. */
+PyAPI_FUNC(int) _Py_traceback_fill_frames(
+    Py_traceback_id_t traceback_id,
+    Py_traceback_interning_table_t *table,
+    PyTracebackFrameInfo *frames,
+    int max_frames);
+
+/* Intern a traceback. Returns traceback_id with refcount 1, or NULL on failure.
+   Interns strings -> string_ids, frames -> frame_ids, then the frame list -> traceback_id. */
+PyAPI_FUNC(Py_traceback_id_t) _Py_traceback_intern(
+    const PyTracebackFrameInfo *frames,
+    int count,
+    Py_traceback_interning_table_t *table);
+
+/* Release a traceback_id. Call when done with the id. */
+PyAPI_FUNC(void) _Py_traceback_release(
+    Py_traceback_id_t traceback_id,
+    Py_traceback_interning_table_t *table);
+
 #ifdef __cplusplus
 }
 #endif

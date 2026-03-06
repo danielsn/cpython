@@ -1762,6 +1762,52 @@ get_traceback_frames(PyObject *self, PyObject *Py_UNUSED(args))
     return result;
 }
 
+// Test traceback interning: intern traceback -> traceback_id (dedup by string/frame/traceback)
+static PyObject *
+traceback_intern_test(PyObject *self, PyObject *Py_UNUSED(args))
+{
+    PyThreadState *tstate = PyThreadState_Get();
+    if (tstate == NULL) {
+        return NULL;
+    }
+
+    PyTracebackFrameInfo frames[32];
+    int count = _Py_GetTracebackFrames(tstate, frames, 32);
+    if (count < 0) {
+        PyErr_SetString(PyExc_RuntimeError, "invalid or freed thread state");
+        return NULL;
+    }
+    if (count == 0) {
+        return Py_BuildValue("OO", Py_None, Py_None);
+    }
+
+    Py_traceback_interning_table_t *table = _Py_traceback_interning_table_new(NULL);
+    if (table == NULL) {
+        return NULL;
+    }
+
+    Py_traceback_id_t id1 = _Py_traceback_intern(frames, count, table);
+    if (id1 == NULL) {
+        _Py_traceback_interning_table_free(table);
+        return NULL;
+    }
+
+    /* Same traceback should return same id */
+    Py_traceback_id_t id2 = _Py_traceback_intern(frames, count, table);
+    if (id2 == NULL) {
+        _Py_traceback_release(id1, table);
+        _Py_traceback_interning_table_free(table);
+        return NULL;
+    }
+
+    int same = (id1 == id2);
+    PyObject *result = Py_BuildValue("Oi", PyLong_FromVoidPtr((void *)id1), same);
+    _Py_traceback_release(id1, table);
+    _Py_traceback_release(id2, table);
+    _Py_traceback_interning_table_free(table);
+    return result;
+}
+
 // Test PyThreadState C API
 static PyObject *
 test_tstate_capi(PyObject *self, PyObject *Py_UNUSED(args))
@@ -2925,6 +2971,8 @@ static PyMethodDef module_functions[] = {
     {"_PyTraceMalloc_GetTraceback", tracemalloc_get_traceback, METH_VARARGS},
     {"get_traceback_frames", get_traceback_frames, METH_NOARGS,
      "Get current traceback as list of (filename, lineno, name) tuples (signal-safe API)"},
+    {"traceback_intern_test", traceback_intern_test, METH_NOARGS,
+     "Test traceback interning: returns (traceback_id, same_id_on_reintern)"},
     {"test_tstate_capi", test_tstate_capi, METH_NOARGS, NULL},
     {"_PyUnicode_TransformDecimalAndSpaceToASCII", unicode_transformdecimalandspacetoascii, METH_O},
     {"check_pyobject_forbidden_bytes_is_freed",

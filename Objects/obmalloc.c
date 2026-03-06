@@ -2254,7 +2254,7 @@ address_in_range(OMState *state, void *p, poolp pool)
 /* Heap profile: track 1 in N objects via linked list in pool->metadata.
  * PYTHON_HEAP_PROFILE_SAMPLE=N (default 10), PYTHON_HEAP_PROFILE_PRINT=1 to enable printing.
  * Entries are in a global doubly-linked list (global_next/global_prev) for iteration.
- * Allocation tracebacks are collected via _Py_GetTracebackFrames when sampling.
+ * Allocation tracebacks are interned via _Py_traceback_intern (dedup by string/frame/traceback).
  */
 #define HEAP_PROFILE_TRACEBACK_MAX 8
 
@@ -2262,14 +2262,14 @@ struct heap_profile_entry {
     pymem_block *ptr;
     uint64_t alloc_count;
     size_t size;
-    PyTracebackFrameInfo traceback_frames[HEAP_PROFILE_TRACEBACK_MAX];
-    int traceback_count;
+    Py_traceback_id_t traceback_id;  /* interned; NULL if none */
     struct heap_profile_entry *next;       /* per-pool list (pool->metadata) */
     struct heap_profile_entry *global_next;
     struct heap_profile_entry *global_prev;
 };
 
 static struct heap_profile_entry *heap_profile_list_head;
+static Py_traceback_interning_table_t *heap_profile_interning_table;
 
 static void
 heap_profile_global_insert(struct heap_profile_entry *ent)
@@ -2298,32 +2298,40 @@ heap_profile_global_remove(struct heap_profile_entry *ent)
 static void
 heap_profile_collect_traceback(struct heap_profile_entry *ent)
 {
+    ent->traceback_id = NULL;
+    if (heap_profile_interning_table == NULL) {
+        return;
+    }
     PyThreadState *tstate = _PyThreadState_GET();
-    int count = (tstate != NULL)
-        ? _Py_GetTracebackFrames(tstate, ent->traceback_frames,
-                                 HEAP_PROFILE_TRACEBACK_MAX)
-        : 0;
-    ent->traceback_count = (count >= 0) ? count : 0;
+    if (tstate == NULL) {
+        return;
+    }
+    PyTracebackFrameInfo frames[HEAP_PROFILE_TRACEBACK_MAX];
+    int count = _Py_GetTracebackFrames(tstate, frames, HEAP_PROFILE_TRACEBACK_MAX);
+    if (count > 0) {
+        ent->traceback_id = _Py_traceback_intern(frames, count,
+                                                 heap_profile_interning_table);
+    }
 }
 
 static void
 heap_profile_dump_traceback(struct heap_profile_entry *ent)
 {
-    if (ent->traceback_count <= 0) {
-        return;
-    }
-    fprintf(stderr, "  Allocation traceback (most recent first):\n");
-    for (int i = 0; i < ent->traceback_count; i++) {
-        const PyTracebackFrameInfo *f = &ent->traceback_frames[i];
-        fprintf(stderr, "    File \"%s\", line %d in %s\n",
-                f->filename, f->lineno, f->name);
+    if (ent->traceback_id != NULL && heap_profile_interning_table != NULL) {
+        _Py_traceback_dump_id(ent->traceback_id, heap_profile_interning_table,
+                              fileno(stderr));
+    } else {
+        fprintf(stderr, "  no traceback\n");
     }
 }
 
 static void
 heap_profile_free_traceback(struct heap_profile_entry *ent)
 {
-    ent->traceback_count = 0;
+    if (ent->traceback_id != NULL && heap_profile_interning_table != NULL) {
+        _Py_traceback_release(ent->traceback_id, heap_profile_interning_table);
+        ent->traceback_id = NULL;
+    }
 }
 
 /* Large allocation: always reserve one extra pointer before the object.
@@ -2350,6 +2358,13 @@ init_heap_profile_sampling(void)
     }
     env = getenv("PYTHON_HEAP_PROFILE_PRINT");
     heap_profile_print_enabled = (env != NULL && env[0] != '\0');
+    if (heap_profile_sample_rate > 0 && heap_profile_interning_table == NULL) {
+        Py_traceback_interning_allocator_t raw_alloc = {
+            PyMem_RawMalloc,
+            PyMem_RawFree,
+        };
+        heap_profile_interning_table = _Py_traceback_interning_table_new(&raw_alloc);
+    }
 }
 
 /* Free a large block. We always allocated the prefix; it is NULL or metadata ptr. */

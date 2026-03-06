@@ -10,6 +10,7 @@
 #include "pycore_pyerrors.h"      // _PyErr_GetRaisedException()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
 #include "pycore_traceback.h"     // EXCEPTION_TB_HEADER
+#include "pycore_hashtable.h"     // _Py_hashtable_*
 
 #include "frameobject.h"          // PyFrame_New()
 
@@ -1685,4 +1686,553 @@ _Py_DumpTraceback_Init(void)
                                     kernelbase, "GetThreadDescription");
     }
 #endif
+}
+
+
+/* Traceback interning table implementation
+   ========================================
+   Three-level interning: strings -> frames -> tracebacks.
+   Uses _Py_hashtable. Each level is refcounted. */
+
+/* Key structs for hash/compare - first fields must match interned structs */
+typedef struct {
+    const char *str;
+    size_t len;
+} tb_string_key_t;
+
+typedef struct {
+    Py_traceback_string_id_t filename_id;
+    int lineno;
+    Py_traceback_string_id_t name_id;
+} tb_frame_key_t;
+
+typedef struct {
+    Py_traceback_frame_id_t *frame_ids;
+    int frame_count;
+} tb_traceback_key_t;
+
+struct _Py_traceback_interned_string {
+    char *str;
+    size_t len;
+    int refcount;
+};
+typedef struct _Py_traceback_interned_string interned_string_t;
+
+struct _Py_traceback_interned_frame {
+    Py_traceback_string_id_t filename_id;
+    int lineno;
+    Py_traceback_string_id_t name_id;
+    int refcount;
+};
+typedef struct _Py_traceback_interned_frame interned_frame_t;
+
+struct _Py_traceback_interned_traceback {
+    Py_traceback_frame_id_t *frame_ids;
+    int frame_count;
+    int refcount;
+};
+typedef struct _Py_traceback_interned_traceback interned_traceback_t;
+
+struct _Py_traceback_interning_table {
+    _Py_hashtable_t *strings;
+    _Py_hashtable_t *frames;
+    _Py_hashtable_t *tracebacks;
+    void *(*malloc)(size_t size);
+    void (*free)(void *ptr);
+};
+
+/* FNV-1a hash - returns Py_uhash_t for _Py_hashtable */
+static Py_uhash_t
+tb_string_hash(const void *key)
+{
+    const tb_string_key_t *k = (const tb_string_key_t *)key;
+    Py_uhash_t h = 2166136261u;
+    for (size_t i = 0; i < k->len; i++) {
+        h ^= (unsigned char)k->str[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static int
+tb_string_compare(const void *k1, const void *k2)
+{
+    const tb_string_key_t *a = (const tb_string_key_t *)k1;
+    const tb_string_key_t *b = (const tb_string_key_t *)k2;
+    return a->len == b->len && memcmp(a->str, b->str, a->len) == 0;
+}
+
+static Py_uhash_t
+tb_frame_hash(const void *key)
+{
+    const tb_frame_key_t *k = (const tb_frame_key_t *)key;
+    Py_uhash_t h = 2166136261u;
+    h ^= (Py_uhash_t)(uintptr_t)k->filename_id;
+    h *= 16777619u;
+    h ^= (Py_uhash_t)(unsigned)k->lineno;
+    h *= 16777619u;
+    h ^= (Py_uhash_t)(uintptr_t)k->name_id;
+    h *= 16777619u;
+    return h;
+}
+
+static int
+tb_frame_compare(const void *k1, const void *k2)
+{
+    const tb_frame_key_t *a = (const tb_frame_key_t *)k1;
+    const tb_frame_key_t *b = (const tb_frame_key_t *)k2;
+    return a->filename_id == b->filename_id
+        && a->lineno == b->lineno
+        && a->name_id == b->name_id;
+}
+
+static Py_uhash_t
+tb_traceback_hash(const void *key)
+{
+    const tb_traceback_key_t *k = (const tb_traceback_key_t *)key;
+    Py_uhash_t h = 2166136261u;
+    for (int i = 0; i < k->frame_count; i++) {
+        h ^= (Py_uhash_t)(uintptr_t)k->frame_ids[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static int
+tb_traceback_compare(const void *k1, const void *k2)
+{
+    const tb_traceback_key_t *a = (const tb_traceback_key_t *)k1;
+    const tb_traceback_key_t *b = (const tb_traceback_key_t *)k2;
+    if (a->frame_count != b->frame_count) {
+        return 0;
+    }
+    return memcmp(a->frame_ids, b->frame_ids,
+                  (size_t)a->frame_count * sizeof(Py_traceback_frame_id_t)) == 0;
+}
+
+static void
+tb_intern_string_release(interned_string_t *ent,
+                         Py_traceback_interning_table_t *table);
+
+static void
+tb_intern_frame_release(interned_frame_t *ent,
+                        Py_traceback_interning_table_t *table);
+
+static void
+tb_intern_traceback_release(interned_traceback_t *ent,
+                            Py_traceback_interning_table_t *table);
+
+Py_traceback_interning_table_t *
+_Py_traceback_interning_table_new(const Py_traceback_interning_allocator_t *allocator)
+{
+    void *(*malloc_fn)(size_t) = allocator && allocator->malloc
+        ? allocator->malloc : (void *(*)(size_t))PyMem_Malloc;
+    void (*free_fn)(void *) = allocator && allocator->free
+        ? allocator->free : (void (*)(void *))PyMem_Free;
+
+    Py_traceback_interning_table_t *table = malloc_fn(sizeof(*table));
+    if (table == NULL) {
+        return NULL;
+    }
+    table->malloc = malloc_fn;
+    table->free = free_fn;
+
+    _Py_hashtable_allocator_t ht_alloc = { malloc_fn, free_fn };
+    table->strings = _Py_hashtable_new_full(tb_string_hash, tb_string_compare,
+                                            NULL, NULL, &ht_alloc);
+    table->frames = _Py_hashtable_new_full(tb_frame_hash, tb_frame_compare,
+                                            NULL, NULL, &ht_alloc);
+    table->tracebacks = _Py_hashtable_new_full(tb_traceback_hash, tb_traceback_compare,
+                                               NULL, NULL, &ht_alloc);
+    if (table->strings == NULL || table->frames == NULL || table->tracebacks == NULL) {
+        if (table->strings) {
+            _Py_hashtable_destroy(table->strings);
+        }
+        if (table->frames) {
+            _Py_hashtable_destroy(table->frames);
+        }
+        if (table->tracebacks) {
+            _Py_hashtable_destroy(table->tracebacks);
+        }
+        free_fn(table);
+        return NULL;
+    }
+    return table;
+}
+
+static void
+tb_intern_string_release(interned_string_t *ent,
+                         Py_traceback_interning_table_t *table)
+{
+    ent->refcount--;
+    if (ent->refcount == 0) {
+        tb_string_key_t key = { .str = ent->str, .len = ent->len };
+        (void)_Py_hashtable_steal(table->strings, &key);
+        table->free(ent->str);
+        table->free(ent);
+    }
+}
+
+static Py_traceback_string_id_t
+tb_intern_string(const char *str, size_t len,
+                 Py_traceback_interning_table_t *table)
+{
+    if (str == NULL || len == 0) {
+        return NULL;
+    }
+    tb_string_key_t lookup_key = { .str = str, .len = len };
+    interned_string_t *ent = (interned_string_t *)_Py_hashtable_get(table->strings,
+                                                                    &lookup_key);
+    if (ent != NULL) {
+        ent->refcount++;
+        return (Py_traceback_string_id_t)ent;
+    }
+
+    ent = table->malloc(sizeof(*ent));
+    if (ent == NULL) {
+        return NULL;
+    }
+    ent->str = table->malloc(len + 1);
+    if (ent->str == NULL) {
+        table->free(ent);
+        return NULL;
+    }
+    memcpy(ent->str, str, len);
+    ent->str[len] = '\0';
+    ent->len = len;
+    ent->refcount = 1;
+
+    if (_Py_hashtable_set(table->strings, ent, ent) < 0) {
+        table->free(ent->str);
+        table->free(ent);
+        return NULL;
+    }
+    return (Py_traceback_string_id_t)ent;
+}
+
+static Py_traceback_frame_id_t
+tb_intern_frame(Py_traceback_string_id_t filename_id,
+                int lineno,
+                Py_traceback_string_id_t name_id,
+                Py_traceback_interning_table_t *table)
+{
+    tb_frame_key_t lookup_key = {
+        .filename_id = filename_id,
+        .lineno = lineno,
+        .name_id = name_id,
+    };
+    interned_frame_t *ent = (interned_frame_t *)_Py_hashtable_get(table->frames,
+                                                                  &lookup_key);
+    if (ent != NULL) {
+        ent->refcount++;
+        return (Py_traceback_frame_id_t)ent;
+    }
+
+    ent = table->malloc(sizeof(*ent));
+    if (ent == NULL) {
+        return NULL;
+    }
+    ent->filename_id = filename_id;
+    ent->lineno = lineno;
+    ent->name_id = name_id;
+    ent->refcount = 1;
+
+    if (filename_id) {
+        ((interned_string_t *)filename_id)->refcount++;
+    }
+    if (name_id) {
+        ((interned_string_t *)name_id)->refcount++;
+    }
+
+    if (_Py_hashtable_set(table->frames, ent, ent) < 0) {
+        if (filename_id) {
+            tb_intern_string_release((interned_string_t *)filename_id, table);
+        }
+        if (name_id) {
+            tb_intern_string_release((interned_string_t *)name_id, table);
+        }
+        table->free(ent);
+        return NULL;
+    }
+    return (Py_traceback_frame_id_t)ent;
+}
+
+static void
+tb_intern_frame_release(interned_frame_t *ent,
+                        Py_traceback_interning_table_t *table)
+{
+    ent->refcount--;
+    if (ent->refcount == 0) {
+        tb_frame_key_t key = {
+            .filename_id = ent->filename_id,
+            .lineno = ent->lineno,
+            .name_id = ent->name_id,
+        };
+        (void)_Py_hashtable_steal(table->frames, &key);
+        if (ent->filename_id) {
+            tb_intern_string_release((interned_string_t *)ent->filename_id, table);
+        }
+        if (ent->name_id) {
+            tb_intern_string_release((interned_string_t *)ent->name_id, table);
+        }
+        table->free(ent);
+    }
+}
+
+static Py_traceback_id_t
+tb_intern_traceback(Py_traceback_frame_id_t *frame_ids, int count,
+                    Py_traceback_interning_table_t *table)
+{
+    if (frame_ids == NULL || count <= 0) {
+        return NULL;
+    }
+    tb_traceback_key_t lookup_key = {
+        .frame_ids = frame_ids,
+        .frame_count = count,
+    };
+    interned_traceback_t *ent = (interned_traceback_t *)_Py_hashtable_get(
+        table->tracebacks, &lookup_key);
+    if (ent != NULL) {
+        ent->refcount++;
+        return (Py_traceback_id_t)ent;
+    }
+
+    ent = table->malloc(sizeof(*ent));
+    if (ent == NULL) {
+        return NULL;
+    }
+    ent->frame_ids = table->malloc((size_t)count * sizeof(Py_traceback_frame_id_t));
+    if (ent->frame_ids == NULL) {
+        table->free(ent);
+        return NULL;
+    }
+    memcpy(ent->frame_ids, frame_ids, (size_t)count * sizeof(frame_ids[0]));
+    ent->frame_count = count;
+    ent->refcount = 1;
+
+    for (int i = 0; i < count; i++) {
+        ((interned_frame_t *)frame_ids[i])->refcount++;
+    }
+
+    if (_Py_hashtable_set(table->tracebacks, ent, ent) < 0) {
+        for (int i = 0; i < count; i++) {
+            tb_intern_frame_release((interned_frame_t *)frame_ids[i], table);
+        }
+        table->free(ent->frame_ids);
+        table->free(ent);
+        return NULL;
+    }
+    return (Py_traceback_id_t)ent;
+}
+
+static void
+tb_intern_traceback_release(interned_traceback_t *ent,
+                             Py_traceback_interning_table_t *table)
+{
+    ent->refcount--;
+    if (ent->refcount == 0) {
+        tb_traceback_key_t key = {
+            .frame_ids = ent->frame_ids,
+            .frame_count = ent->frame_count,
+        };
+        (void)_Py_hashtable_steal(table->tracebacks, &key);
+        for (int i = 0; i < ent->frame_count; i++) {
+            tb_intern_frame_release((interned_frame_t *)ent->frame_ids[i], table);
+        }
+        table->free(ent->frame_ids);
+        table->free(ent);
+    }
+}
+
+Py_traceback_id_t
+_Py_traceback_intern(const PyTracebackFrameInfo *frames,
+                     int count,
+                     Py_traceback_interning_table_t *table)
+{
+    if (frames == NULL || count <= 0 || table == NULL) {
+        return NULL;
+    }
+
+    Py_traceback_frame_id_t *frame_ids = table->malloc((size_t)count * sizeof(Py_traceback_frame_id_t));
+    if (frame_ids == NULL) {
+        return NULL;
+    }
+
+    for (int i = 0; i < count; i++) {
+        const PyTracebackFrameInfo *f = &frames[i];
+        size_t filename_len = strlen(f->filename);
+        size_t name_len = strlen(f->name);
+
+        Py_traceback_string_id_t filename_id = tb_intern_string(
+            f->filename, filename_len, table);
+        Py_traceback_string_id_t name_id = tb_intern_string(
+            f->name, name_len, table);
+
+        if (filename_id == NULL && filename_len > 0) {
+            goto fail;
+        }
+        if (name_id == NULL && name_len > 0) {
+            if (filename_id) {
+                tb_intern_string_release((interned_string_t *)filename_id, table);
+            }
+            goto fail;
+        }
+
+        frame_ids[i] = tb_intern_frame(filename_id, f->lineno, name_id, table);
+        if (filename_id) {
+            tb_intern_string_release((interned_string_t *)filename_id, table);
+        }
+        if (name_id) {
+            tb_intern_string_release((interned_string_t *)name_id, table);
+        }
+        if (frame_ids[i] == NULL) {
+            for (int j = 0; j < i; j++) {
+                tb_intern_frame_release((interned_frame_t *)frame_ids[j], table);
+            }
+            goto fail;
+        }
+    }
+
+    Py_traceback_id_t result = tb_intern_traceback(frame_ids, count, table);
+    for (int i = 0; i < count; i++) {
+        tb_intern_frame_release((interned_frame_t *)frame_ids[i], table);
+    }
+    table->free(frame_ids);
+    return result;
+
+fail:
+    table->free(frame_ids);
+    return NULL;
+}
+
+void
+_Py_traceback_release(Py_traceback_id_t traceback_id,
+                      Py_traceback_interning_table_t *table)
+{
+    if (traceback_id != NULL && table != NULL) {
+        tb_intern_traceback_release((interned_traceback_t *)traceback_id, table);
+    }
+}
+
+void
+_Py_traceback_dump_id(Py_traceback_id_t traceback_id,
+                      Py_traceback_interning_table_t *table,
+                      int fd)
+{
+    if (traceback_id == NULL || table == NULL) {
+        return;
+    }
+    interned_traceback_t *tb = (interned_traceback_t *)traceback_id;
+    if (tb->frame_count <= 0) {
+        return;
+    }
+    PUTS(fd, "  Allocation traceback (most recent first):\n");
+    for (int i = 0; i < tb->frame_count; i++) {
+        interned_frame_t *f = (interned_frame_t *)tb->frame_ids[i];
+        const char *filename = f->filename_id
+            ? ((interned_string_t *)f->filename_id)->str : "???";
+        const char *name = f->name_id
+            ? ((interned_string_t *)f->name_id)->str : "???";
+        PUTS(fd, "    File \"");
+        PUTS(fd, filename);
+        PUTS(fd, "\", line ");
+        _Py_DumpDecimal(fd, (size_t)f->lineno);
+        PUTS(fd, " in ");
+        PUTS(fd, name);
+        PUTS(fd, "\n");
+    }
+}
+
+int
+_Py_traceback_fill_frames(Py_traceback_id_t traceback_id,
+                         Py_traceback_interning_table_t *table,
+                         PyTracebackFrameInfo *frames,
+                         int max_frames)
+{
+    if (traceback_id == NULL || table == NULL || frames == NULL || max_frames <= 0) {
+        return 0;
+    }
+    interned_traceback_t *tb = (interned_traceback_t *)traceback_id;
+    if (tb->frame_count <= 0) {
+        return 0;
+    }
+    int count = tb->frame_count;
+    if (count > max_frames) {
+        count = max_frames;
+    }
+    for (int i = 0; i < count; i++) {
+        interned_frame_t *f = (interned_frame_t *)tb->frame_ids[i];
+        const char *filename = f->filename_id
+            ? ((interned_string_t *)f->filename_id)->str : "???";
+        const char *name = f->name_id
+            ? ((interned_string_t *)f->name_id)->str : "???";
+
+        strncpy(frames[i].filename, filename, Py_TRACEBACK_FRAME_FILENAME_MAX - 1);
+        frames[i].filename[Py_TRACEBACK_FRAME_FILENAME_MAX - 1] = '\0';
+
+        frames[i].lineno = f->lineno;
+
+        strncpy(frames[i].name, name, Py_TRACEBACK_FRAME_NAME_MAX - 1);
+        frames[i].name[Py_TRACEBACK_FRAME_NAME_MAX - 1] = '\0';
+    }
+    return count;
+}
+
+/* Foreach callback to free table entries (used when destroying table) */
+static int
+tb_free_string_cb(_Py_hashtable_t *ht, const void *key, const void *value, void *ud)
+{
+    Py_traceback_interning_table_t *table = (Py_traceback_interning_table_t *)ud;
+    (void)ht;
+    (void)key;
+    interned_string_t *ent = (interned_string_t *)value;
+    table->free(ent->str);
+    table->free(ent);
+    return 0;
+}
+
+static int
+tb_free_frame_cb(_Py_hashtable_t *ht, const void *key, const void *value, void *ud)
+{
+    Py_traceback_interning_table_t *table = (Py_traceback_interning_table_t *)ud;
+    (void)ht;
+    (void)key;
+    interned_frame_t *ent = (interned_frame_t *)value;
+    if (ent->filename_id) {
+        tb_intern_string_release((interned_string_t *)ent->filename_id, table);
+    }
+    if (ent->name_id) {
+        tb_intern_string_release((interned_string_t *)ent->name_id, table);
+    }
+    table->free(ent);
+    return 0;
+}
+
+static int
+tb_free_traceback_cb(_Py_hashtable_t *ht, const void *key, const void *value, void *ud)
+{
+    Py_traceback_interning_table_t *table = (Py_traceback_interning_table_t *)ud;
+    (void)ht;
+    (void)key;
+    interned_traceback_t *ent = (interned_traceback_t *)value;
+    table->free(ent->frame_ids);
+    table->free(ent);
+    return 0;
+}
+
+void
+_Py_traceback_interning_table_free(Py_traceback_interning_table_t *table)
+{
+    if (table == NULL) {
+        return;
+    }
+    /* Free tracebacks first (no cross-refs to frames in our free path),
+       then frames (releases strings), then strings. */
+    _Py_hashtable_foreach(table->tracebacks, tb_free_traceback_cb, table);
+    _Py_hashtable_foreach(table->frames, tb_free_frame_cb, table);
+    _Py_hashtable_foreach(table->strings, tb_free_string_cb, table);
+    _Py_hashtable_destroy(table->tracebacks);
+    _Py_hashtable_destroy(table->frames);
+    _Py_hashtable_destroy(table->strings);
+    table->free(table);
 }
