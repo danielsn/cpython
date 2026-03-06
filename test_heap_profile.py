@@ -3,10 +3,13 @@
 Test script for heap profile sampling.
 
 Run with:
-    PYTHON_HEAP_PROFILE_SAMPLE=10 PYTHON_HEAP_PROFILE_PRINT=1 ./python.exe test_heap_profile.py
+    PYTHON_HEAP_PROFILE_SAMPLE_BYTES=5000 PYTHON_HEAP_PROFILE_PRINT=1 ./python test_heap_profile.py
+
+  PYTHON_HEAP_PROFILE_SAMPLE_BYTES=N: ~1 sample per N bytes allocated (byte-weighted Poisson).
+  PYTHON_HEAP_PROFILE_DEBUG=1: also print native C stacks when no Python traceback.
 
 Or run the built-in verification (spawns subprocess):
-    ./python.exe test_heap_profile.py --check
+    ./python test_heap_profile.py --check
 
 This exercises the heap profiler by allocating and freeing small and large
 objects. Small allocations use pool metadata; large allocations use an extra
@@ -65,7 +68,7 @@ def main():
     if "--check" in sys.argv:
         # Run self in subprocess with profiling, verify we get output
         env = os.environ.copy()
-        env["PYTHON_HEAP_PROFILE_SAMPLE"] = "10"  # required: disabled by default
+        env["PYTHON_HEAP_PROFILE_SAMPLE_BYTES"] = "5000"  # ~1 sample per 5KB
         env["PYTHON_HEAP_PROFILE_PRINT"] = "1"
         result = subprocess.run(
             [sys.executable, __file__],
@@ -113,17 +116,34 @@ def main():
         if 'File "' not in result2.stderr or " in " not in result2.stderr:
             print("Test failed: traceback missing file/line info")
             return 1
-        # Verify our call chain appears (level3 -> level2 -> level1)
-        if "level3" not in result2.stderr or "level2" not in result2.stderr:
-            print("Test failed: traceback missing expected call chain (level3/level2)")
+        # Verify expected frames occur in correct order (most recent first: level3, level2, level1)
+        # Format: "  Allocation traceback (most recent first):\n    File \"...\", line N in level3\n ..."
+        expected = [" in level3", " in level2", " in level1"]
+        for block in result2.stderr.split("Allocation traceback"):
+            if " in level3" not in block:
+                continue
+            # Check all expected frames appear in this block in order
+            pos = 0
+            for want in expected:
+                idx = block.find(want, pos)
+                if idx < 0:
+                    break
+                pos = idx + len(want)
+            else:
+                # All found in order
+                break
+        else:
+            print("Test failed: traceback missing expected call chain (level3 -> level2 -> level1)")
+            print("stderr sample:", result2.stderr[-1500:] if len(result2.stderr) > 1500 else result2.stderr)
             return 1
 
         print("OK: heap profiling produced expected output")
         return 0
 
-    if "PYTHON_HEAP_PROFILE_SAMPLE" not in os.environ or "PYTHON_HEAP_PROFILE_PRINT" not in os.environ:
-        print("Run with: PYTHON_HEAP_PROFILE_SAMPLE=10 PYTHON_HEAP_PROFILE_PRINT=1 ./python.exe test_heap_profile.py")
-        print("Or: ./python.exe test_heap_profile.py --check")
+    if "PYTHON_HEAP_PROFILE_SAMPLE_BYTES" not in os.environ or "PYTHON_HEAP_PROFILE_PRINT" not in os.environ:
+        print("Run with: PYTHON_HEAP_PROFILE_SAMPLE_BYTES=5000 PYTHON_HEAP_PROFILE_PRINT=1 ./python test_heap_profile.py")
+        print("  (PYTHON_HEAP_PROFILE_SAMPLE_BYTES=N means ~1 sample per N bytes allocated)")
+        print("Or: ./python test_heap_profile.py --check")
         return 1
 
     if "--traceback" in sys.argv:
