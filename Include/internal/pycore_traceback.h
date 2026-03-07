@@ -249,6 +249,11 @@ PyAPI_FUNC(Py_traceback_id_t) _Py_traceback_intern(
     int count,
     Py_traceback_interning_table_t *table);
 
+/* Retain a traceback_id. Call when creating another reference. */
+PyAPI_FUNC(void) _Py_traceback_retain(
+    Py_traceback_id_t traceback_id,
+    Py_traceback_interning_table_t *table);
+
 /* Release a traceback_id. Call when done with the id. */
 PyAPI_FUNC(void) _Py_traceback_release(
     Py_traceback_id_t traceback_id,

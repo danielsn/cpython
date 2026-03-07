@@ -1860,6 +1860,123 @@ heap_profile_iterate(PyObject *self, PyObject *Py_UNUSED(args))
     return result;
 }
 
+// Iterate over accumulated samples (freed since last reset). Same format as heap_profile_iterate.
+// ptr is None for accumulated entries (object already freed).
+static PyObject *
+heap_profile_iterate_accumulated(PyObject *self, PyObject *Py_UNUSED(args))
+{
+    if (!heap_profile_is_enabled()) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "heap profiling not enabled; set PYTHON_HEAP_PROFILE_SAMPLE_BYTES");
+        return NULL;
+    }
+
+    PyObject *result = PyList_New(0);
+    if (result == NULL) {
+        return NULL;
+    }
+
+    Py_traceback_interning_table_t *table = heap_profile_get_interning_table();
+    PyTracebackFrameInfo frames[HEAP_PROFILE_TRACEBACK_MAX];
+
+    for (struct heap_profile_entry *ent = heap_profile_get_first_accumulated();
+         ent != NULL; ent = heap_profile_get_next(ent)) {
+        PyObject *ptr_obj = (ent->ptr != NULL)
+            ? PyLong_FromVoidPtr((void *)ent->ptr)
+            : Py_None;
+        if (ptr_obj == NULL) {
+            Py_DECREF(result);
+            return NULL;
+        }
+        if (ptr_obj == Py_None) {
+            Py_INCREF(Py_None);
+        }
+
+        PyObject *tb_frames = Py_None;
+        if (ent->traceback_id != NULL && table != NULL) {
+            int n = _Py_traceback_fill_frames(ent->traceback_id, table,
+                                             frames, HEAP_PROFILE_TRACEBACK_MAX);
+            if (n > 0) {
+                tb_frames = PyList_New(n);
+                if (tb_frames == NULL) {
+                    Py_DECREF(ptr_obj);
+                    Py_DECREF(result);
+                    return NULL;
+                }
+                for (int i = 0; i < n; i++) {
+                    PyObject *t = Py_BuildValue("(sis)", frames[i].filename,
+                                                frames[i].lineno,
+                                                frames[i].name);
+                    if (t == NULL) {
+                        Py_DECREF(tb_frames);
+                        Py_DECREF(ptr_obj);
+                        Py_DECREF(result);
+                        return NULL;
+                    }
+                    PyList_SET_ITEM(tb_frames, i, t);
+                }
+            }
+        }
+        PyObject *size_obj = PyLong_FromSize_t(ent->size);
+        PyObject *bytes_obj = PyLong_FromUnsignedLongLong(
+            (unsigned long long)ent->bytes_since_last_sample);
+        PyObject *allocs_obj = PyLong_FromUnsignedLongLong(
+            (unsigned long long)ent->allocs_since_last_sample);
+        if (size_obj == NULL || bytes_obj == NULL || allocs_obj == NULL) {
+            Py_DECREF(ptr_obj);
+            Py_XDECREF(size_obj);
+            Py_XDECREF(bytes_obj);
+            Py_XDECREF(allocs_obj);
+            if (tb_frames != Py_None) {
+                Py_DECREF(tb_frames);
+            }
+            Py_DECREF(result);
+            return NULL;
+        }
+        PyObject *item = Py_BuildValue("OOOOO", ptr_obj, size_obj,
+            bytes_obj, allocs_obj, tb_frames);
+        Py_DECREF(ptr_obj);
+        Py_DECREF(size_obj);
+        Py_DECREF(bytes_obj);
+        Py_DECREF(allocs_obj);
+        if (tb_frames != Py_None) {
+            Py_DECREF(tb_frames);
+        }
+        if (item == NULL) {
+            Py_DECREF(result);
+            return NULL;
+        }
+        if (PyList_Append(result, item) < 0) {
+            Py_DECREF(item);
+            Py_DECREF(result);
+            return NULL;
+        }
+        Py_DECREF(item);
+    }
+    return result;
+}
+
+// Iterate over all allocation samples since last reset. Same as iterate_accumulated.
+// Allocation list gets a copy at sample time, so this includes all samples.
+static PyObject *
+heap_profile_iterate_allocation_samples(PyObject *self, PyObject *Py_UNUSED(args))
+{
+    return heap_profile_iterate_accumulated(self, NULL);
+}
+
+// Clear accumulated samples and free their storage.
+static PyObject *
+heap_profile_reset_accumulated_impl(PyObject *self, PyObject *Py_UNUSED(args))
+{
+    if (!heap_profile_is_enabled()) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "heap profiling not enabled; set PYTHON_HEAP_PROFILE_SAMPLE_BYTES");
+        return NULL;
+    }
+    heap_profile_reset_accumulated();
+    Py_RETURN_NONE;
+}
+
 /* Export heap profile to pprof/OTel format, return as bytes. For testing. */
 static PyObject *
 heap_profile_export_pprof_bytes(PyObject *self, PyObject *Py_UNUSED(args))
@@ -3164,6 +3281,12 @@ static PyMethodDef module_functions[] = {
      "Iterate over heap profile entries. Returns list of (ptr, size, "
      "bytes_since_last_sample, allocs_since_last_sample, traceback_frames). "
      "Requires PYTHON_HEAP_PROFILE_SAMPLE_BYTES to be set."},
+    {"heap_profile_iterate_accumulated", heap_profile_iterate_accumulated, METH_NOARGS,
+     "Iterate over all samples since last reset (copy added at sample time). Same format as heap_profile_iterate."},
+    {"heap_profile_iterate_allocation_samples", heap_profile_iterate_allocation_samples, METH_NOARGS,
+     "Iterate over all allocation samples: accumulated + live. For allocation profiling."},
+    {"heap_profile_reset_accumulated", heap_profile_reset_accumulated_impl, METH_NOARGS,
+     "Clear accumulated samples and free their storage."},
     {"heap_profile_export_pprof_bytes", heap_profile_export_pprof_bytes, METH_NOARGS,
      "Export heap profile to pprof protobuf. Returns bytes. Requires heap profiling enabled."},
     {"heap_profile_export_otel_bytes", heap_profile_export_otel_bytes, METH_NOARGS,

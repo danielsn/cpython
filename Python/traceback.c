@@ -2152,6 +2152,16 @@ fail:
 }
 
 void
+_Py_traceback_retain(Py_traceback_id_t traceback_id,
+                     Py_traceback_interning_table_t *table)
+{
+    if (traceback_id != NULL && table != NULL) {
+        interned_traceback_t *ent = (interned_traceback_t *)traceback_id;
+        ent->refcount++;
+    }
+}
+
+void
 _Py_traceback_release(Py_traceback_id_t traceback_id,
                       Py_traceback_interning_table_t *table)
 {

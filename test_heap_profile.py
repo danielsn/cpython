@@ -223,6 +223,7 @@ def main():
 
         # Code that runs traceback test (level1->level2->level3) then exports.
         # Keep allocations alive until after export (heap profile tracks live allocations).
+        # Also verify allocation profile (iterate_allocation_samples) has expected frames.
         traceback_export_code = """
 def level3():
     return [1, 2, 3] * 100
@@ -239,6 +240,18 @@ otel = _testinternalcapi.heap_profile_export_otel_bytes()
 print(pprof.hex())
 print("---")
 print(otel.hex())
+print("---")
+# Verify allocation profile has expected stack trace
+samples = _testinternalcapi.heap_profile_iterate_allocation_samples()
+expected = ["level3", "level2", "level1"]
+alloc_ok = False
+for ptr, size, bytes_w, allocs_w, tb in samples:
+    if tb is not None and len(tb) >= 3:
+        names = [f[2] for f in tb]
+        if all(want in names for want in expected):
+            alloc_ok = True
+            break
+print("ALLOC_OK" if alloc_ok else "ALLOC_FAIL")
 """
 
         # Run traceback test + export in one subprocess
@@ -255,11 +268,12 @@ print(otel.hex())
             return 1
 
         parts = result.stdout.strip().split("\n---\n")
-        if len(parts) != 2:
-            print("Export test failed: expected pprof and OTel output")
+        if len(parts) != 3:
+            print("Export test failed: expected pprof, OTel, and allocation output")
             return 1
         pprof = bytes.fromhex(parts[0].replace("\n", ""))
         otel = bytes.fromhex(parts[1].replace("\n", ""))
+        alloc_result = parts[2].strip()
 
         err = validate_proto(pprof, "pprof")
         if err:
@@ -285,6 +299,11 @@ print(otel.hex())
             print(f"Export test failed: {err}")
             return 1
         print("OK: OTel string_table contains expected stack trace (level3, level2, level1)")
+
+        if alloc_result != "ALLOC_OK":
+            print("Export test failed: allocation profile missing expected frames (level3, level2, level1)")
+            return 1
+        print("OK: allocation profile contains expected stack trace (level3, level2, level1)")
         return 0
 
     if "PYTHON_HEAP_PROFILE_SAMPLE_BYTES" not in os.environ or "PYTHON_HEAP_PROFILE_PRINT" not in os.environ:

@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdlib.h>               /* getenv(), strtoul() */
 #include <stdio.h>                /* fprintf(), fileno(), stderr */
+#include <string.h>               /* memcpy() */
 #include <math.h>                 /* log() for Poisson sampling */
 
 #include "Python.h"
@@ -15,7 +16,8 @@
 
 /* All heap profiler state in one place. */
 static struct heap_profiler_state {
-    struct heap_profile_entry *list_head;
+    struct heap_profile_entry *list_head;       /* live allocations */
+    struct heap_profile_entry *accumulated_head; /* freed samples since last reset */
     Py_traceback_interning_table_t *interning_table;
     int print_enabled;
     int print_debug;   /* PYTHON_HEAP_PROFILE_DEBUG: native stacks, etc. */
@@ -50,6 +52,17 @@ heap_profile_global_remove(struct heap_profile_entry *ent)
     if (ent->global_next != NULL) {
         ent->global_next->global_prev = ent->global_prev;
     }
+}
+
+static void
+heap_profile_accumulated_insert(struct heap_profile_entry *ent)
+{
+    ent->global_next = heap_profiler.accumulated_head;
+    ent->global_prev = NULL;
+    if (heap_profiler.accumulated_head != NULL) {
+        heap_profiler.accumulated_head->global_prev = ent;
+    }
+    heap_profiler.accumulated_head = ent;
 }
 
 static void
@@ -184,6 +197,17 @@ heap_profile_record_sample(size_t size, pymem_block *ptr)
     heap_profiler.allocs_since_last = 0;
     heap_profile_collect_traceback(ent);
     heap_profile_global_insert(ent);
+
+    /* Copy to allocation list (all samples since last reset). */
+    struct heap_profile_entry *copy = PyMem_RawMalloc(sizeof(*copy));
+    if (copy != NULL) {
+        memcpy(copy, ent, sizeof(*copy));
+        copy->ptr = NULL;
+        if (copy->traceback_id != NULL && heap_profiler.interning_table != NULL) {
+            _Py_traceback_retain(copy->traceback_id, heap_profiler.interning_table);
+        }
+        heap_profile_accumulated_insert(copy);
+    }
     return ent;
 }
 
@@ -299,6 +323,28 @@ heap_profile_get_next(struct heap_profile_entry *ent)
         return NULL;
     }
     return ent->global_next;
+}
+
+HEAP_PROFILE_EXPORT struct heap_profile_entry *
+heap_profile_get_first_accumulated(void)
+{
+    if (!heap_profile_is_enabled()) {
+        return NULL;
+    }
+    return heap_profiler.accumulated_head;
+}
+
+HEAP_PROFILE_EXPORT void
+heap_profile_reset_accumulated(void)
+{
+    struct heap_profile_entry *ent = heap_profiler.accumulated_head;
+    while (ent != NULL) {
+        struct heap_profile_entry *next = ent->global_next;
+        heap_profile_free_traceback(ent);
+        PyMem_RawFree(ent);
+        ent = next;
+    }
+    heap_profiler.accumulated_head = NULL;
 }
 
 HEAP_PROFILE_EXPORT Py_traceback_interning_table_t *

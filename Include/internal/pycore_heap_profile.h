@@ -18,7 +18,8 @@ extern "C" {
  * PYTHON_HEAP_PROFILE_DEBUG=1: print native C stacks when no Python traceback.
  *
  * bytes_since_last_sample, allocs_since_last_sample: weights for statistical upscaling.
- * Entries are in a global doubly-linked list (global_next/global_prev) for iteration.
+ * Live entries are in a global doubly-linked list (global_next/global_prev).
+ * A copy of each sample is added to the allocation list at sample time.
  * Allocation tracebacks are interned via _Py_traceback_intern (dedup by string/frame/traceback).
  */
 #define HEAP_PROFILE_TRACEBACK_MAX 8
@@ -77,6 +78,12 @@ PyAPI_FUNC(int) heap_profile_is_enabled(void);
  * Safe to call; entries may be removed by other threads during iteration. */
 PyAPI_FUNC(struct heap_profile_entry *) heap_profile_get_first(void);
 PyAPI_FUNC(struct heap_profile_entry *) heap_profile_get_next(struct heap_profile_entry *ent);
+
+/* Allocation list: copy of every sample since last reset (added at sample time).
+ * heap_profile_get_first_accumulated/get_next iterate over them.
+ * heap_profile_reset_accumulated() clears the list and frees entries. */
+PyAPI_FUNC(struct heap_profile_entry *) heap_profile_get_first_accumulated(void);
+PyAPI_FUNC(void) heap_profile_reset_accumulated(void);
 
 /* Get the interning table (for resolving traceback_id via _Py_traceback_fill_frames).
  * Returns NULL if profiling disabled or table not created. */
