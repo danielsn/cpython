@@ -1763,7 +1763,7 @@ get_traceback_frames(PyObject *self, PyObject *Py_UNUSED(args))
     return result;
 }
 
-// Iterate over heap profile entries. Returns list of (ptr, size, alloc_count,
+// Iterate over heap profile entries. Returns list of (ptr, size,
 // bytes_since_last_sample, allocs_since_last_sample, traceback_frames).
 // traceback_frames is list of (filename, lineno, name) or None if no traceback.
 static PyObject *
@@ -1822,17 +1822,13 @@ heap_profile_iterate(PyObject *self, PyObject *Py_UNUSED(args))
             }
         }
         PyObject *size_obj = PyLong_FromSize_t(ent->size);
-        PyObject *alloc_count_obj = PyLong_FromUnsignedLongLong(
-            (unsigned long long)ent->alloc_count);
         PyObject *bytes_obj = PyLong_FromUnsignedLongLong(
             (unsigned long long)ent->bytes_since_last_sample);
         PyObject *allocs_obj = PyLong_FromUnsignedLongLong(
             (unsigned long long)ent->allocs_since_last_sample);
-        if (size_obj == NULL || alloc_count_obj == NULL || bytes_obj == NULL
-            || allocs_obj == NULL) {
+        if (size_obj == NULL || bytes_obj == NULL || allocs_obj == NULL) {
             Py_DECREF(ptr_obj);
             Py_XDECREF(size_obj);
-            Py_XDECREF(alloc_count_obj);
             Py_XDECREF(bytes_obj);
             Py_XDECREF(allocs_obj);
             if (tb_frames != Py_None) {
@@ -1841,11 +1837,10 @@ heap_profile_iterate(PyObject *self, PyObject *Py_UNUSED(args))
             Py_DECREF(result);
             return NULL;
         }
-        PyObject *item = Py_BuildValue("OOOOOO", ptr_obj, size_obj,
-            alloc_count_obj, bytes_obj, allocs_obj, tb_frames);
+        PyObject *item = Py_BuildValue("OOOOO", ptr_obj, size_obj,
+            bytes_obj, allocs_obj, tb_frames);
         Py_DECREF(ptr_obj);
         Py_DECREF(size_obj);
-        Py_DECREF(alloc_count_obj);
         Py_DECREF(bytes_obj);
         Py_DECREF(allocs_obj);
         if (tb_frames != Py_None) {
@@ -3166,7 +3161,7 @@ static PyMethodDef module_functions[] = {
     {"traceback_intern_test", traceback_intern_test, METH_NOARGS,
      "Test traceback interning: returns (traceback_id, same_id_on_reintern)"},
     {"heap_profile_iterate", heap_profile_iterate, METH_NOARGS,
-     "Iterate over heap profile entries. Returns list of (ptr, size, alloc_count, "
+     "Iterate over heap profile entries. Returns list of (ptr, size, "
      "bytes_since_last_sample, allocs_since_last_sample, traceback_frames). "
      "Requires PYTHON_HEAP_PROFILE_SAMPLE_BYTES to be set."},
     {"heap_profile_export_pprof_bytes", heap_profile_export_pprof_bytes, METH_NOARGS,

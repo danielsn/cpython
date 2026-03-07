@@ -39,7 +39,6 @@ enum heap_profile_traceback_reason {
 
 struct heap_profile_entry {
     pymem_block *ptr;
-    uint64_t alloc_count;
     size_t size;
     /* Statistical upscaling: this sample represents these since last sample. */
     uint64_t bytes_since_last_sample;   /* weight in bytes */

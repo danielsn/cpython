@@ -17,7 +17,6 @@
 static struct heap_profiler_state {
     struct heap_profile_entry *list_head;
     Py_traceback_interning_table_t *interning_table;
-    uint64_t alloc_counter;
     int print_enabled;
     int print_debug;   /* PYTHON_HEAP_PROFILE_DEBUG: native stacks, etc. */
     int initialized;
@@ -26,7 +25,7 @@ static struct heap_profiler_state {
     uint64_t allocated_bytes;
     uint64_t next_sample_target;
     uint64_t rand_state;
-    uint64_t last_sample_alloc_counter;  /* for allocs_since_last_sample */
+    uint64_t allocs_since_last;  /* running count, reset on each sample */
 } heap_profiler = {0};
 
 static void
@@ -143,7 +142,7 @@ heap_profile_next_target(uint64_t mean)
 
 /* Returns true if we should sample this allocation. Updates state.
  * When sampling, sets *out_bytes_since_last to bytes accumulated (for upscaling).
- * Caller must increment heap_profiler.alloc_counter before calling. */
+ */
 static int
 heap_profile_should_sample(size_t size, uint64_t *out_bytes_since_last)
 {
@@ -169,7 +168,7 @@ heap_profile_record_sample(size_t size, pymem_block *ptr)
     if (heap_profiler.sample_interval_bytes == 0) {
         return NULL;
     }
-    heap_profiler.alloc_counter++;
+    heap_profiler.allocs_since_last++;
     uint64_t bytes_since_last;
     if (!heap_profile_should_sample(size, &bytes_since_last)) {
         return NULL;
@@ -179,12 +178,10 @@ heap_profile_record_sample(size_t size, pymem_block *ptr)
         return NULL;
     }
     ent->ptr = ptr;
-    ent->alloc_count = heap_profiler.alloc_counter;
     ent->size = size;
     ent->bytes_since_last_sample = bytes_since_last;
-    ent->allocs_since_last_sample = heap_profiler.alloc_counter
-        - heap_profiler.last_sample_alloc_counter;
-    heap_profiler.last_sample_alloc_counter = heap_profiler.alloc_counter;
+    ent->allocs_since_last_sample = heap_profiler.allocs_since_last;
+    heap_profiler.allocs_since_last = 0;
     heap_profile_collect_traceback(ent);
     heap_profile_global_insert(ent);
     return ent;
@@ -196,11 +193,10 @@ heap_profile_print_entry(struct heap_profile_entry *ent, void *ptr)
     if (!heap_profiler.print_enabled) {
         return;
     }
-    fprintf(stderr, "heap profile free: %p size=%zu weight_bytes=%llu weight_allocs=%llu alloc_count=%llu\n",
+    fprintf(stderr, "heap profile free: %p size=%zu weight_bytes=%llu weight_allocs=%llu\n",
             ptr, ent->size,
             (unsigned long long)ent->bytes_since_last_sample,
-            (unsigned long long)ent->allocs_since_last_sample,
-            (unsigned long long)ent->alloc_count);
+            (unsigned long long)ent->allocs_since_last_sample);
     heap_profile_dump_traceback(ent);
 }
 
@@ -223,7 +219,7 @@ init_heap_profile_sampling(void)
     }
     if (heap_profiler.sample_interval_bytes > 0) {
         heap_profiler.allocated_bytes = 0;
-        heap_profiler.last_sample_alloc_counter = 0;
+        heap_profiler.allocs_since_last = 0;
         heap_profiler.next_sample_target = heap_profile_next_target(
             heap_profiler.sample_interval_bytes);
     }
