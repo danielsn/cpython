@@ -15,7 +15,6 @@ extern "C" {
 
 /* Heap profile: byte-weighted Poisson sampling via linked list in pool->metadata.
  * PYTHON_HEAP_PROFILE_SAMPLE_BYTES=N (~1 sample per N bytes), PYTHON_HEAP_PROFILE_PRINT=1.
- * PYTHON_HEAP_PROFILE_DEBUG=1: print native C stacks when no Python traceback.
  *
  * bytes_since_last_sample, allocs_since_last_sample: weights for statistical upscaling.
  * Live entries are in a global doubly-linked list (global_next/global_prev).
@@ -23,20 +22,10 @@ extern "C" {
  * Allocation tracebacks are interned via _Py_traceback_intern (dedup by string/frame/traceback).
  */
 #define HEAP_PROFILE_TRACEBACK_MAX 8
-#define HEAP_PROFILE_NATIVE_BT_MAX 12
 
 /* Large allocation: always reserve one extra pointer before the object.
  * Prefix is NULL if unused, or a pointer to heap_profile_entry. */
 #define HEAP_PROFILE_LARGE_PREFIX sizeof(void *)
-
-/* Reason for missing traceback (when traceback_id is NULL). Helps debugging. */
-enum heap_profile_traceback_reason {
-    HEAP_PROFILE_TB_OK = 0,           /* have traceback */
-    HEAP_PROFILE_TB_NO_TABLE,         /* interning table not created */
-    HEAP_PROFILE_TB_NO_TSTATE,        /* no PyThreadState (e.g. C-only context) */
-    HEAP_PROFILE_TB_NO_FRAMES,        /* no Python frames on stack */
-    HEAP_PROFILE_TB_INTERN_FAILED,    /* _Py_traceback_intern returned NULL */
-};
 
 struct heap_profile_entry {
     pymem_block *ptr;
@@ -45,10 +34,6 @@ struct heap_profile_entry {
     uint64_t bytes_since_last_sample;   /* weight in bytes */
     uint64_t allocs_since_last_sample;  /* weight in allocation count */
     Py_traceback_id_t traceback_id;  /* interned; NULL if none */
-    unsigned char traceback_reason;   /* enum above; meaningful when traceback_id==NULL */
-    /* Native C backtrace when no Python frames (traceback_id==NULL). */
-    void *native_bt[HEAP_PROFILE_NATIVE_BT_MAX];
-    int native_bt_count;              /* 0 = no native backtrace captured */
     struct heap_profile_entry *next;       /* per-pool list (pool->metadata) */
     struct heap_profile_entry *global_next;
     struct heap_profile_entry *global_prev;
@@ -59,9 +44,10 @@ struct heap_profile_entry {
 /* Initialize heap profile sampling from env vars. Idempotent. */
 void init_heap_profile_sampling(void);
 
-/* Record a sampled allocation. Returns new entry (caller links it) or NULL.
+/* Record a sampled allocation. Inserts into the list at *metadata_head.
  * ptr: block pointer for pool allocs, NULL for large allocs. */
-struct heap_profile_entry *heap_profile_record_sample(size_t size, pymem_block *ptr);
+void heap_profile_record_sample(size_t size, pymem_block *ptr,
+                                struct heap_profile_entry **metadata_head);
 
 /* Allocate a large block with profiling metadata. Only when profiling is enabled.
  * zero_initialize: true for calloc semantics, false for malloc.

@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stdlib.h>               /* getenv(), strtoul() */
 #include <stdio.h>                /* fprintf(), fileno(), stderr */
-#include <string.h>               /* memcpy() */
+#include <string.h>               /* memcpy(), snprintf() */
 #include <math.h>                 /* log() for Poisson sampling */
 
 #include "Python.h"
@@ -20,7 +20,6 @@ static struct heap_profiler_state {
     struct heap_profile_entry *accumulated_head; /* freed samples since last reset */
     Py_traceback_interning_table_t *interning_table;
     int print_enabled;
-    int print_debug;   /* PYTHON_HEAP_PROFILE_DEBUG: native stacks, etc. */
     int initialized;
     /* Byte-weighted Poisson sampling */
     uint64_t sample_interval_bytes;
@@ -29,17 +28,6 @@ static struct heap_profiler_state {
     uint64_t rand_state;
     uint64_t allocs_since_last;  /* running count, reset on each sample */
 } heap_profiler = {0};
-
-static void
-heap_profile_global_insert(struct heap_profile_entry *ent)
-{
-    ent->global_next = heap_profiler.list_head;
-    ent->global_prev = NULL;
-    if (heap_profiler.list_head != NULL) {
-        heap_profiler.list_head->global_prev = ent;
-    }
-    heap_profiler.list_head = ent;
-}
 
 static void
 heap_profile_global_remove(struct heap_profile_entry *ent)
@@ -54,58 +42,38 @@ heap_profile_global_remove(struct heap_profile_entry *ent)
     }
 }
 
-static void
-heap_profile_accumulated_insert(struct heap_profile_entry *ent)
+static Py_traceback_id_t
+heap_profile_pseudoframe(const char *reason)
 {
-    ent->global_next = heap_profiler.accumulated_head;
-    ent->global_prev = NULL;
-    if (heap_profiler.accumulated_head != NULL) {
-        heap_profiler.accumulated_head->global_prev = ent;
-    }
-    heap_profiler.accumulated_head = ent;
+    PyTracebackFrameInfo pseudo = {0};
+    snprintf(pseudo.filename, sizeof(pseudo.filename), "<heap_profile>");
+    snprintf(pseudo.name, sizeof(pseudo.name), "%s", reason);
+    pseudo.lineno = 0;
+    return _Py_traceback_intern(&pseudo, 1, heap_profiler.interning_table);
 }
 
-static void
-heap_profile_collect_traceback(struct heap_profile_entry *ent)
+static Py_traceback_id_t
+heap_profile_collect_traceback(void)
 {
-    ent->traceback_id = NULL;
-    ent->traceback_reason = HEAP_PROFILE_TB_NO_TABLE;
-    ent->native_bt_count = 0;
     if (heap_profiler.interning_table == NULL) {
-        return;
+        return NULL;
     }
-    ent->traceback_reason = HEAP_PROFILE_TB_NO_TSTATE;
     PyThreadState *tstate = _PyThreadState_GET();
     if (tstate == NULL) {
-        ent->native_bt_count = _Py_GetBacktrace(ent->native_bt,
-                                                HEAP_PROFILE_NATIVE_BT_MAX);
-        return;
+        return heap_profile_pseudoframe("no thread state (C-only context?)");
     }
     PyTracebackFrameInfo frames[HEAP_PROFILE_TRACEBACK_MAX];
     int count = _Py_GetTracebackFrames(tstate, frames, HEAP_PROFILE_TRACEBACK_MAX);
-    ent->traceback_reason = HEAP_PROFILE_TB_NO_FRAMES;
     if (count > 0) {
-        ent->traceback_id = _Py_traceback_intern(frames, count,
-                                                 heap_profiler.interning_table);
-        if (ent->traceback_id != NULL) {
-            ent->traceback_reason = HEAP_PROFILE_TB_OK;
-        } else {
-            ent->traceback_reason = HEAP_PROFILE_TB_INTERN_FAILED;
+        Py_traceback_id_t id = _Py_traceback_intern(frames, count,
+                                                    heap_profiler.interning_table);
+        if (id != NULL) {
+            return id;
         }
-    } else {
-        /* No Python frames - capture native C backtrace for debugging */
-        ent->native_bt_count = _Py_GetBacktrace(ent->native_bt,
-                                                 HEAP_PROFILE_NATIVE_BT_MAX);
+        return heap_profile_pseudoframe("traceback interning failed");
     }
+    return heap_profile_pseudoframe("no Python frames on stack");
 }
-
-static const char *heap_profile_traceback_reason_str[] = {
-    [HEAP_PROFILE_TB_OK] = "ok",
-    [HEAP_PROFILE_TB_NO_TABLE] = "no interning table",
-    [HEAP_PROFILE_TB_NO_TSTATE] = "no thread state (C-only context?)",
-    [HEAP_PROFILE_TB_NO_FRAMES] = "no Python frames on stack",
-    [HEAP_PROFILE_TB_INTERN_FAILED] = "traceback interning failed",
-};
 
 static void
 heap_profile_dump_traceback(struct heap_profile_entry *ent)
@@ -114,14 +82,7 @@ heap_profile_dump_traceback(struct heap_profile_entry *ent)
         _Py_traceback_dump_id(ent->traceback_id, heap_profiler.interning_table,
                               fileno(stderr));
     } else {
-        unsigned char r = ent->traceback_reason;
-        const char *reason = (r <= HEAP_PROFILE_TB_INTERN_FAILED)
-            ? heap_profile_traceback_reason_str[r] : "unknown";
-        fprintf(stderr, "  no Python traceback (%s)\n", reason);
-        if (heap_profiler.print_debug && ent->native_bt_count > 0) {
-            _Py_DumpBacktraceFromArray(fileno(stderr), ent->native_bt,
-                                        ent->native_bt_count);
-        }
+        fprintf(stderr, "  no Python traceback\n");
     }
 }
 
@@ -154,20 +115,28 @@ heap_profile_next_target(uint64_t mean)
 }
 
 /* Returns true if we should sample this allocation. Updates state.
- * When sampling, sets *out_bytes_since_last to bytes accumulated (for upscaling).
+ * When sampling, sets *out_bytes_since_last and *out_allocs_since_last (for upscaling).
  */
 static int
-heap_profile_should_sample(size_t size, uint64_t *out_bytes_since_last)
+heap_profile_should_sample(size_t size, uint64_t *out_bytes_since_last,
+                          uint64_t *out_allocs_since_last)
 {
     if (heap_profiler.sample_interval_bytes == 0) {
         return 0;
+    }
+    if (heap_profiler.allocs_since_last < UINT64_MAX) {
+        heap_profiler.allocs_since_last++;
     }
     heap_profiler.allocated_bytes += size;
     if (heap_profiler.allocated_bytes >= heap_profiler.next_sample_target) {
         if (out_bytes_since_last != NULL) {
             *out_bytes_since_last = heap_profiler.allocated_bytes;
         }
+        if (out_allocs_since_last != NULL) {
+            *out_allocs_since_last = heap_profiler.allocs_since_last;
+        }
         heap_profiler.allocated_bytes = 0;
+        heap_profiler.allocs_since_last = 0;
         heap_profiler.next_sample_target = heap_profile_next_target(
             heap_profiler.sample_interval_bytes);
         return 1;
@@ -175,38 +144,56 @@ heap_profile_should_sample(size_t size, uint64_t *out_bytes_since_last)
     return 0;
 }
 
-struct heap_profile_entry *
-heap_profile_record_sample(size_t size, pymem_block *ptr)
+void
+heap_profile_record_sample(size_t size, pymem_block *ptr,
+                           struct heap_profile_entry **metadata_head)
 {
     assert(heap_profiler.initialized && heap_profiler.sample_interval_bytes != 0);
-    heap_profiler.allocs_since_last++;
     uint64_t bytes_since_last;
-    if (!heap_profile_should_sample(size, &bytes_since_last)) {
-        return NULL;
+    uint64_t allocs_since_last;
+    if (!heap_profile_should_sample(size, &bytes_since_last, &allocs_since_last)) {
+        return;
     }
-    struct heap_profile_entry *ent = PyMem_RawMalloc(sizeof(*ent));
-    if (ent == NULL) {
-        return NULL;
-    }
-    ent->ptr = ptr;
-    ent->size = size;
-    ent->bytes_since_last_sample = bytes_since_last;
-    ent->allocs_since_last_sample = heap_profiler.allocs_since_last;
-    heap_profiler.allocs_since_last = 0;
-    heap_profile_collect_traceback(ent);
-    heap_profile_global_insert(ent);
 
-    /* Copy to allocation list (all samples since last reset). */
-    struct heap_profile_entry *copy = PyMem_RawMalloc(sizeof(*copy));
-    if (copy != NULL) {
-        memcpy(copy, ent, sizeof(*copy));
-        copy->ptr = NULL;
-        if (copy->traceback_id != NULL && heap_profiler.interning_table != NULL) {
-            _Py_traceback_retain(copy->traceback_id, heap_profiler.interning_table);
-        }
-        heap_profile_accumulated_insert(copy);
+    struct heap_profile_entry *heap_sample = PyMem_RawMalloc(sizeof(*heap_sample));
+    if (heap_sample == NULL) {
+        return;
     }
-    return ent;
+
+    Py_traceback_id_t traceback_id = heap_profile_collect_traceback();
+
+    *heap_sample = (struct heap_profile_entry){
+        .ptr = ptr,
+        .size = size,
+        .bytes_since_last_sample = bytes_since_last,
+        .allocs_since_last_sample = allocs_since_last,
+        .traceback_id = traceback_id,
+        .next = *metadata_head,
+        .global_next = heap_profiler.list_head,
+        .global_prev = NULL,
+    };
+    *metadata_head = heap_sample;
+    if (heap_profiler.list_head) heap_profiler.list_head->global_prev = heap_sample;
+    heap_profiler.list_head = heap_sample;
+
+
+    struct heap_profile_entry *alloc_sample = PyMem_RawMalloc(sizeof(*alloc_sample));
+    if (alloc_sample != NULL) {
+        _Py_traceback_retain(traceback_id, heap_profiler.interning_table);
+
+        *alloc_sample = (struct heap_profile_entry){
+            .ptr = ptr,
+            .size = size,
+            .bytes_since_last_sample = bytes_since_last,
+            .allocs_since_last_sample = allocs_since_last,
+            .traceback_id = traceback_id,
+            .next = NULL,
+            .global_next = heap_profiler.accumulated_head,
+            .global_prev = NULL,
+        };
+        if (heap_profiler.accumulated_head) heap_profiler.accumulated_head->global_prev = alloc_sample;
+        heap_profiler.accumulated_head = alloc_sample;
+    }
 }
 
 static void
@@ -247,8 +234,6 @@ init_heap_profile_sampling(void)
     }
     env = getenv("PYTHON_HEAP_PROFILE_PRINT");
     heap_profiler.print_enabled = (env != NULL && env[0] != '\0');
-    env = getenv("PYTHON_HEAP_PROFILE_DEBUG");
-    heap_profiler.print_debug = (env != NULL && env[0] != '\0');
     if (heap_profiler.sample_interval_bytes > 0
         && heap_profiler.interning_table == NULL) {
         Py_traceback_interning_allocator_t raw_alloc = {
@@ -269,12 +254,8 @@ heap_profile_alloc_large_block(size_t nbytes, bool zero_initialize)
         return NULL;
     }
 
-    void *metadata = NULL;
-    struct heap_profile_entry *ent = heap_profile_record_sample(nbytes, NULL);
-    if (ent != NULL) {
-        ent->next = NULL;
-        metadata = ent;
-    }
+    struct heap_profile_entry *metadata = NULL;
+    heap_profile_record_sample(nbytes, NULL, &metadata);
     *(void **)block = metadata;
     return (char *)block + HEAP_PROFILE_LARGE_PREFIX;
 }

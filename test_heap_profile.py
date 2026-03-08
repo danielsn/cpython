@@ -8,8 +8,9 @@ Run with:
   PYTHON_HEAP_PROFILE_SAMPLE_BYTES=N: ~1 sample per N bytes allocated (byte-weighted Poisson).
   PYTHON_HEAP_PROFILE_DEBUG=1: also print native C stacks when no Python traceback.
 
-Or run the built-in verification (spawns subprocess):
-    ./python test_heap_profile.py --check
+Or run the built-in verification (spawns subprocess). Use SAMPLE_BYTES only;
+PRINT is added for the test subprocesses to avoid flooding stderr:
+    PYTHON_HEAP_PROFILE_SAMPLE_BYTES=5000 ./python test_heap_profile.py --check
 
 Or validate pprof/OTel protobuf export:
     ./python test_heap_profile.py --check-export
@@ -69,7 +70,6 @@ def run_with_traceback_test():
 
 def main():
     if "--check" in sys.argv:
-        # Run self in subprocess with profiling, verify we get output
         env = os.environ.copy()
         env["PYTHON_HEAP_PROFILE_SAMPLE_BYTES"] = "5000"  # ~1 sample per 5KB
         env["PYTHON_HEAP_PROFILE_PRINT"] = "1"
@@ -309,7 +309,7 @@ print("ALLOC_OK" if alloc_ok else "ALLOC_FAIL")
     if "PYTHON_HEAP_PROFILE_SAMPLE_BYTES" not in os.environ or "PYTHON_HEAP_PROFILE_PRINT" not in os.environ:
         print("Run with: PYTHON_HEAP_PROFILE_SAMPLE_BYTES=5000 PYTHON_HEAP_PROFILE_PRINT=1 ./python test_heap_profile.py")
         print("  (PYTHON_HEAP_PROFILE_SAMPLE_BYTES=N means ~1 sample per N bytes allocated)")
-        print("Or: ./python test_heap_profile.py --check")
+        print("Or: PYTHON_HEAP_PROFILE_SAMPLE_BYTES=5000 ./python test_heap_profile.py --check")
         print("Or: ./python test_heap_profile.py --check-export  # validate pprof/OTel protobuf")
         return 1
 

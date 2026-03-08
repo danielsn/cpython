@@ -2457,13 +2457,9 @@ pymalloc_alloc(OMState *state, void *Py_UNUSED(ctx), size_t nbytes)
 
     /* Profile sampled allocations: add to pool's metadata linked list */
     if (heap_profile_is_enabled()) {
-        size_t alloc_size = INDEX2SIZE(POOL_ADDR(bp)->szidx);
-        struct heap_profile_entry *ent = heap_profile_record_sample(alloc_size, bp);
-        if (ent != NULL) {
-            poolp alloc_pool = POOL_ADDR(bp);  /* bp may be from allocate_from_new_pool */
-            ent->next = alloc_pool->metadata;
-            alloc_pool->metadata = ent;
-        }
+        poolp alloc_pool = POOL_ADDR(bp);  /* bp may be from allocate_from_new_pool */
+        size_t alloc_size = INDEX2SIZE(alloc_pool->szidx);
+        heap_profile_record_sample(alloc_size, bp, &alloc_pool->metadata);
     }
 
     return (void *)bp;
