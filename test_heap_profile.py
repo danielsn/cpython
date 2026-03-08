@@ -3,13 +3,11 @@
 Test script for heap profile sampling.
 
 Run with:
-    PYTHON_HEAP_PROFILE_SAMPLE_BYTES=5000 PYTHON_HEAP_PROFILE_PRINT=1 ./python test_heap_profile.py
+    PYTHON_HEAP_PROFILE_SAMPLE_BYTES=5000 ./python test_heap_profile.py
 
   PYTHON_HEAP_PROFILE_SAMPLE_BYTES=N: ~1 sample per N bytes allocated (byte-weighted Poisson).
-  PYTHON_HEAP_PROFILE_DEBUG=1: also print native C stacks when no Python traceback.
 
-Or run the built-in verification (spawns subprocess). Use SAMPLE_BYTES only;
-PRINT is added for the test subprocesses to avoid flooding stderr:
+Or run the built-in verification (spawns subprocess):
     PYTHON_HEAP_PROFILE_SAMPLE_BYTES=5000 ./python test_heap_profile.py --check
 
 Or validate pprof/OTel protobuf export:
@@ -17,7 +15,7 @@ Or validate pprof/OTel protobuf export:
 
 This exercises the heap profiler by allocating and freeing small and large
 objects. Small allocations use pool metadata; large allocations use an extra
-pointer before the object. When tracked objects are freed, they are printed.
+pointer before the object.
 """
 import sys
 import subprocess
@@ -72,74 +70,71 @@ def main():
     if "--check" in sys.argv:
         env = os.environ.copy()
         env["PYTHON_HEAP_PROFILE_SAMPLE_BYTES"] = "5000"  # ~1 sample per 5KB
-        env["PYTHON_HEAP_PROFILE_PRINT"] = "1"
+        check_code = """
+import gc
+import _testinternalcapi
+PYMALLOC_THRESHOLD = 512
+
+# Run profiling allocations (small + large)
+for i in range(200):
+    x = [1, 2, 3, 4, 5]
+    y = (10, 20, 30)
+    z = {"a": 1, "b": 2}
+    del x, y, z
+for i in range(50):
+    large = bytearray(PYMALLOC_THRESHOLD + 1)
+    del large
+gc.collect()
+
+# Verify via API: samples exist and include large allocations
+samples = _testinternalcapi.heap_profile_iterate_allocation_samples()
+has_large = False
+for ptr, size, bytes_w, allocs_w, tb in samples:
+    if size > PYMALLOC_THRESHOLD:
+        has_large = True
+        break
+if not has_large:
+    print("TEST_FAIL: no large allocation")
+    exit(1)
+
+# Traceback test: allocations from Python code should have tracebacks
+def level3():
+    return [1, 2, 3] * 100
+def level2():
+    return level3()
+def level1():
+    return level2()
+live = []
+for _ in range(30):
+    live.append(level1())
+samples = _testinternalcapi.heap_profile_iterate_allocation_samples()
+expected = ["level3", "level2", "level1"]
+alloc_ok = False
+for ptr, size, bytes_w, allocs_w, tb in samples:
+    if tb is not None and len(tb) >= 3:
+        names = [f[2] for f in tb]
+        if all(want in names for want in expected):
+            alloc_ok = True
+            break
+if not alloc_ok:
+    print("TEST_FAIL: traceback missing level3/level2/level1")
+    exit(1)
+print("OK")
+"""
         result = subprocess.run(
-            [sys.executable, __file__],
+            [sys.executable, "-c", check_code],
             env=env,
             capture_output=True,
             text=True,
         )
         if result.returncode != 0:
             print(f"Test failed: exit code {result.returncode}")
+            print("stderr:", result.stderr)
             return 1
-        if "heap profile free:" not in result.stderr:
-            print("Test failed: no 'heap profile free:' lines in stderr")
-            print("stderr sample:", result.stderr[:500])
+        if "OK" not in result.stdout:
+            print("Test failed: expected OK in output")
+            print("stdout:", result.stdout)
             return 1
-
-        # Verify large allocations are tracked (size > 512)
-        import re
-        has_large = False
-        for line in result.stderr.splitlines():
-            if "heap profile free:" in line:
-                m = re.search(r"size=(\d+)", line)
-                if m:
-                    size = int(m.group(1))
-                    if size > PYMALLOC_THRESHOLD:
-                        has_large = True
-        if not has_large:
-            print("Test failed: no large allocation tracking (size > 512)")
-            return 1
-
-        # Run traceback test: allocations from Python code should have tracebacks
-        result2 = subprocess.run(
-            [sys.executable, "-c",
-             "from test_heap_profile import run_with_traceback_test; "
-             "run_with_traceback_test()"],
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        if result2.returncode != 0:
-            print(f"Traceback test failed: exit code {result2.returncode}")
-            return 1
-        if "Allocation traceback" not in result2.stderr:
-            print("Test failed: no 'Allocation traceback' in output")
-            return 1
-        if 'File "' not in result2.stderr or " in " not in result2.stderr:
-            print("Test failed: traceback missing file/line info")
-            return 1
-        # Verify expected frames occur in correct order (most recent first: level3, level2, level1)
-        # Format: "  Allocation traceback (most recent first):\n    File \"...\", line N in level3\n ..."
-        expected = [" in level3", " in level2", " in level1"]
-        for block in result2.stderr.split("Allocation traceback"):
-            if " in level3" not in block:
-                continue
-            # Check all expected frames appear in this block in order
-            pos = 0
-            for want in expected:
-                idx = block.find(want, pos)
-                if idx < 0:
-                    break
-                pos = idx + len(want)
-            else:
-                # All found in order
-                break
-        else:
-            print("Test failed: traceback missing expected call chain (level3 -> level2 -> level1)")
-            print("stderr sample:", result2.stderr[-1500:] if len(result2.stderr) > 1500 else result2.stderr)
-            return 1
-
         print("OK: heap profiling produced expected output")
         return 0
 
@@ -306,8 +301,8 @@ print("ALLOC_OK" if alloc_ok else "ALLOC_FAIL")
         print("OK: allocation profile contains expected stack trace (level3, level2, level1)")
         return 0
 
-    if "PYTHON_HEAP_PROFILE_SAMPLE_BYTES" not in os.environ or "PYTHON_HEAP_PROFILE_PRINT" not in os.environ:
-        print("Run with: PYTHON_HEAP_PROFILE_SAMPLE_BYTES=5000 PYTHON_HEAP_PROFILE_PRINT=1 ./python test_heap_profile.py")
+    if "PYTHON_HEAP_PROFILE_SAMPLE_BYTES" not in os.environ:
+        print("Run with: PYTHON_HEAP_PROFILE_SAMPLE_BYTES=5000 ./python test_heap_profile.py")
         print("  (PYTHON_HEAP_PROFILE_SAMPLE_BYTES=N means ~1 sample per N bytes allocated)")
         print("Or: PYTHON_HEAP_PROFILE_SAMPLE_BYTES=5000 ./python test_heap_profile.py --check")
         print("Or: ./python test_heap_profile.py --check-export  # validate pprof/OTel protobuf")

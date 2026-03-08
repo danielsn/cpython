@@ -3,7 +3,7 @@
 
 #include <stdbool.h>
 #include <stdlib.h>               /* getenv(), strtoul() */
-#include <stdio.h>                /* fprintf(), fileno(), stderr */
+#include <stdio.h>                /* snprintf() */
 #include <string.h>               /* memcpy(), snprintf() */
 #include <math.h>                 /* log() for Poisson sampling */
 
@@ -19,7 +19,6 @@ static struct heap_profiler_state {
     struct heap_profile_entry *list_head;       /* live allocations */
     struct heap_profile_entry *accumulated_head; /* freed samples since last reset */
     Py_traceback_interning_table_t *interning_table;
-    int print_enabled;
     int initialized;
     /* Byte-weighted Poisson sampling */
     uint64_t sample_interval_bytes;
@@ -76,23 +75,21 @@ heap_profile_collect_traceback(void)
 }
 
 static void
-heap_profile_dump_traceback(struct heap_profile_entry *ent)
-{
-    if (ent->traceback_id != NULL && heap_profiler.interning_table != NULL) {
-        _Py_traceback_dump_id(ent->traceback_id, heap_profiler.interning_table,
-                              fileno(stderr));
-    } else {
-        fprintf(stderr, "  no Python traceback\n");
-    }
-}
-
-static void
 heap_profile_free_traceback(struct heap_profile_entry *ent)
 {
     if (ent->traceback_id != NULL && heap_profiler.interning_table != NULL) {
         _Py_traceback_release(ent->traceback_id, heap_profiler.interning_table);
         ent->traceback_id = NULL;
     }
+}
+
+/* Remove entry from global list, release traceback, free. */
+static void
+heap_profile_release_entry(struct heap_profile_entry *ent)
+{
+    heap_profile_global_remove(ent);
+    heap_profile_free_traceback(ent);
+    PyMem_RawFree(ent);
 }
 
 /* Draw next sample target from exponential distribution with given mean.
@@ -196,19 +193,6 @@ heap_profile_record_sample(size_t size, pymem_block *ptr,
     }
 }
 
-static void
-heap_profile_print_entry(struct heap_profile_entry *ent, void *ptr)
-{
-    if (!heap_profiler.print_enabled) {
-        return;
-    }
-    fprintf(stderr, "heap profile free: %p size=%zu weight_bytes=%llu weight_allocs=%llu\n",
-            ptr, ent->size,
-            (unsigned long long)ent->bytes_since_last_sample,
-            (unsigned long long)ent->allocs_since_last_sample);
-    heap_profile_dump_traceback(ent);
-}
-
 void
 init_heap_profile_sampling(void)
 {
@@ -232,8 +216,6 @@ init_heap_profile_sampling(void)
         heap_profiler.next_sample_target = heap_profile_next_target(
             heap_profiler.sample_interval_bytes);
     }
-    env = getenv("PYTHON_HEAP_PROFILE_PRINT");
-    heap_profiler.print_enabled = (env != NULL && env[0] != '\0');
     if (heap_profiler.sample_interval_bytes > 0
         && heap_profiler.interning_table == NULL) {
         Py_traceback_interning_allocator_t raw_alloc = {
@@ -266,17 +248,13 @@ heap_profile_free_large_block(void *p)
     void *block = (char *)p - HEAP_PROFILE_LARGE_PREFIX;
     void *metadata = *(void **)block;
     if (metadata != NULL) {
-        struct heap_profile_entry *ent = metadata;
-        heap_profile_global_remove(ent);
-        heap_profile_print_entry(ent, p);
-        heap_profile_free_traceback(ent);
-        PyMem_RawFree(metadata);
+        heap_profile_release_entry(metadata);
     }
     PyMem_RawFree(block);
 }
 
 /* Realloc a large block. Semantics: free the old allocation (remove from profile,
- * print if enabled) then make a new allocation with a fresh sampling decision.
+ * then make a new allocation with a fresh sampling decision.
  * We realloc the underlying memory first; only if that succeeds do we free the
  * old metadata, so that on failure the caller's block remains valid and tracked. */
 void *
@@ -291,11 +269,7 @@ heap_profile_realloc_large_block(void *p, size_t nbytes)
      * block after realloc, since the block may have moved. */
     void *metadata = *(void **)block;
     if (metadata != NULL) {
-        struct heap_profile_entry *ent = metadata;
-        heap_profile_global_remove(ent);
-        heap_profile_print_entry(ent, p);
-        heap_profile_free_traceback(ent);
-        PyMem_RawFree(metadata);
+        heap_profile_release_entry(metadata);
     }
     /* Fresh sampling decision for the new size. */
     struct heap_profile_entry *new_metadata = NULL;
@@ -305,17 +279,14 @@ heap_profile_realloc_large_block(void *p, size_t nbytes)
 }
 
 void
-heap_profile_remove_and_print(poolp pool, pymem_block *p)
+heap_profile_remove_from_pool(poolp pool, pymem_block *p)
 {
     struct heap_profile_entry **pnext = &pool->metadata;
     while (*pnext != NULL) {
         struct heap_profile_entry *ent = *pnext;
         if (ent->ptr == p) {
             *pnext = ent->next;
-            heap_profile_global_remove(ent);
-            heap_profile_print_entry(ent, (void *)p);
-            heap_profile_free_traceback(ent);
-            PyMem_RawFree(ent);
+            heap_profile_release_entry(ent);
             return;
         }
         pnext = &ent->next;

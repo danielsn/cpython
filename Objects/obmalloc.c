@@ -2717,9 +2717,9 @@ pymalloc_free(OMState *state, void *Py_UNUSED(ctx), void *p)
     }
     /* We allocated this address. */
 
-    /* If this block was profiled, remove from list and optionally print */
+    /* If this block was profiled, remove from pool's list and release */
     if (pool->metadata != NULL) {
-        heap_profile_remove_and_print(pool, (pymem_block *)p);
+        heap_profile_remove_from_pool(pool, (pymem_block *)p);
     }
 
     /* Link p to the start of the pool's freeblock list.  Since

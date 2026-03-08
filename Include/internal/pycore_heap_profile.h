@@ -14,7 +14,7 @@ extern "C" {
 #include "pycore_traceback.h"
 
 /* Heap profile: byte-weighted Poisson sampling via linked list in pool->metadata.
- * PYTHON_HEAP_PROFILE_SAMPLE_BYTES=N (~1 sample per N bytes), PYTHON_HEAP_PROFILE_PRINT=1.
+ * PYTHON_HEAP_PROFILE_SAMPLE_BYTES=N (~1 sample per N bytes).
  *
  * bytes_since_last_sample, allocs_since_last_sample: weights for statistical upscaling.
  * Live entries are in a global doubly-linked list (global_next/global_prev).
@@ -60,8 +60,8 @@ void heap_profile_free_large_block(void *p);
 /* Realloc a large block: equivalent to free + new alloc with fresh sampling. */
 void *heap_profile_realloc_large_block(void *p, size_t nbytes);
 
-/* Remove profiled block from pool's list and optionally print. */
-void heap_profile_remove_and_print(poolp pool, pymem_block *p);
+/* Remove profiled block from pool's list and release. */
+void heap_profile_remove_from_pool(poolp pool, pymem_block *p);
 
 /* Iteration API for C extensions. Export for _testinternalcapi shared extension. */
 
