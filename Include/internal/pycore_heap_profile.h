@@ -57,6 +57,9 @@ void *heap_profile_alloc_large_block(size_t nbytes, bool zero_initialize);
 /* Free a large block (handles prefix and metadata). */
 void heap_profile_free_large_block(void *p);
 
+/* Realloc a large block: equivalent to free + new alloc with fresh sampling. */
+void *heap_profile_realloc_large_block(void *p, size_t nbytes);
+
 /* Remove profiled block from pool's list and optionally print. */
 void heap_profile_remove_and_print(poolp pool, pymem_block *p);
 

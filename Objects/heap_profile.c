@@ -275,6 +275,35 @@ heap_profile_free_large_block(void *p)
     PyMem_RawFree(block);
 }
 
+/* Realloc a large block. Semantics: free the old allocation (remove from profile,
+ * print if enabled) then make a new allocation with a fresh sampling decision.
+ * We realloc the underlying memory first; only if that succeeds do we free the
+ * old metadata, so that on failure the caller's block remains valid and tracked. */
+void *
+heap_profile_realloc_large_block(void *p, size_t nbytes)
+{
+    void *block = (char *)p - HEAP_PROFILE_LARGE_PREFIX;
+    block = PyMem_RawRealloc(block, nbytes + HEAP_PROFILE_LARGE_PREFIX);
+    if (block == NULL) {
+        return NULL;
+    }
+    /* Remove old sample from profile (if any). Read metadata from the current
+     * block after realloc, since the block may have moved. */
+    void *metadata = *(void **)block;
+    if (metadata != NULL) {
+        struct heap_profile_entry *ent = metadata;
+        heap_profile_global_remove(ent);
+        heap_profile_print_entry(ent, p);
+        heap_profile_free_traceback(ent);
+        PyMem_RawFree(metadata);
+    }
+    /* Fresh sampling decision for the new size. */
+    struct heap_profile_entry *new_metadata = NULL;
+    heap_profile_record_sample(nbytes, NULL, &new_metadata);
+    *(void **)block = new_metadata;
+    return (char *)block + HEAP_PROFILE_LARGE_PREFIX;
+}
+
 void
 heap_profile_remove_and_print(poolp pool, pymem_block *p)
 {

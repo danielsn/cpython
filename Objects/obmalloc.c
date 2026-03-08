@@ -2870,18 +2870,9 @@ _PyObject_Realloc(void *ctx, void *ptr, size_t nbytes)
         return ptr2;
     }
 
-    /* Large allocation: prefix only when profiling is active */
+    /* Large allocation: realloc = free + new alloc with fresh sampling */
     if (heap_profile_is_enabled()) {
-        void *block = (char *)ptr - HEAP_PROFILE_LARGE_PREFIX;
-        void *new_block = PyMem_RawRealloc(block, nbytes + HEAP_PROFILE_LARGE_PREFIX);
-        if (new_block != NULL) {
-            /* Metadata is preserved (realloc copies the prefix). Just update size. */
-            void *metadata = *(void **)new_block;
-            if (metadata != NULL) {
-                ((struct heap_profile_entry *)metadata)->size = nbytes;
-            }
-            return (char *)new_block + HEAP_PROFILE_LARGE_PREFIX;
-        }
+        return heap_profile_realloc_large_block(ptr, nbytes);
     } else {
         void *new_block = PyMem_RawRealloc(ptr, nbytes);
         if (new_block != NULL) {
