@@ -178,9 +178,7 @@ heap_profile_should_sample(size_t size, uint64_t *out_bytes_since_last)
 struct heap_profile_entry *
 heap_profile_record_sample(size_t size, pymem_block *ptr)
 {
-    if (heap_profiler.sample_interval_bytes == 0) {
-        return NULL;
-    }
+    assert(heap_profiler.initialized && heap_profiler.sample_interval_bytes != 0);
     heap_profiler.allocs_since_last++;
     uint64_t bytes_since_last;
     if (!heap_profile_should_sample(size, &bytes_since_last)) {
@@ -261,6 +259,26 @@ init_heap_profile_sampling(void)
     }
 }
 
+void *
+heap_profile_alloc_large_block(size_t nbytes, bool zero_initialize)
+{
+    void *block = zero_initialize
+        ? PyMem_RawCalloc(1, nbytes + HEAP_PROFILE_LARGE_PREFIX)
+        : PyMem_RawMalloc(nbytes + HEAP_PROFILE_LARGE_PREFIX);
+    if (block == NULL) {
+        return NULL;
+    }
+
+    void *metadata = NULL;
+    struct heap_profile_entry *ent = heap_profile_record_sample(nbytes, NULL);
+    if (ent != NULL) {
+        ent->next = NULL;
+        metadata = ent;
+    }
+    *(void **)block = metadata;
+    return (char *)block + HEAP_PROFILE_LARGE_PREFIX;
+}
+
 void
 heap_profile_free_large_block(void *p)
 {
@@ -304,7 +322,8 @@ heap_profile_remove_and_print(poolp pool, pymem_block *p)
 HEAP_PROFILE_EXPORT int
 heap_profile_is_enabled(void)
 {
-    return heap_profiler.sample_interval_bytes > 0 && heap_profiler.initialized;
+    init_heap_profile_sampling();
+    return heap_profiler.sample_interval_bytes > 0;
 }
 
 HEAP_PROFILE_EXPORT struct heap_profile_entry *

@@ -63,6 +63,11 @@ void init_heap_profile_sampling(void);
  * ptr: block pointer for pool allocs, NULL for large allocs. */
 struct heap_profile_entry *heap_profile_record_sample(size_t size, pymem_block *ptr);
 
+/* Allocate a large block with profiling metadata. Only when profiling is enabled.
+ * zero_initialize: true for calloc semantics, false for malloc.
+ * Returns the user pointer, or NULL on failure. */
+void *heap_profile_alloc_large_block(size_t nbytes, bool zero_initialize);
+
 /* Free a large block (handles prefix and metadata). */
 void heap_profile_free_large_block(void *p);
 
