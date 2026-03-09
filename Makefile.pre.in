@@ -554,6 +554,8 @@ OBJECT_OBJS=	\
 		Objects/namespaceobject.o \
 		Objects/object.o \
 		Objects/obmalloc.o \
+		Objects/heap_profile.o \
+		Objects/heap_profile_export.o \
 		Objects/picklebufobject.o \
 		Objects/rangeobject.o \
 		Objects/setobject.o \

@@ -4,13 +4,13 @@
 #include "pycore_interp.h"        // _PyInterpreterState_HasFeature
 #include "pycore_mmap.h"          // _PyAnnotateMemoryMap()
 #include "pycore_object.h"        // _PyDebugAllocatorStats() definition
+#include "pycore_heap_profile.h"
 #include "pycore_obmalloc.h"
 #include "pycore_obmalloc_init.h"
 #include "pycore_pyerrors.h"      // _Py_FatalErrorFormat()
 #include "pycore_pymem.h"
 #include "pycore_pystate.h"       // _PyInterpreterState_GET
 #include "pycore_stats.h"         // OBJECT_STAT_INC_COND()
-
 #include <stdlib.h>               // malloc()
 #include <stdbool.h>
 #include <stdio.h>                // fopen(), fgets(), sscanf()
@@ -1789,7 +1789,7 @@ _PyInterpreterState_GetAllocatedBlocks(PyInterpreterState *interp)
         assert(base <= (uintptr_t) allarenas[i].pool_address);
         for (; base < (uintptr_t) allarenas[i].pool_address; base += POOL_SIZE) {
             poolp p = (poolp)base;
-            n += p->ref.count;
+            n += p->count;
         }
     }
     return n;
@@ -2250,7 +2250,6 @@ address_in_range(OMState *state, void *p, poolp pool)
 
 /*==========================================================================*/
 
-// Called when freelist is exhausted.  Extend the freelist if there is
 // space for a block.  Otherwise, remove this pool from usedpools.
 static void
 pymalloc_pool_extend(poolp pool, uint size)
@@ -2376,7 +2375,9 @@ allocate_from_new_pool(OMState *state, uint size)
     pool->prevpool = next;
     next->nextpool = pool;
     next->prevpool = pool;
-    pool->ref.count = 1;
+    pool->count = 1;
+    pool->metadata = NULL;
+    memset(pool->flags, 0, sizeof(pool->flags));
     if (pool->szidx == size) {
         /* Luckily, this pool last contained blocks
          * of the same size class, so its header
@@ -2438,7 +2439,7 @@ pymalloc_alloc(OMState *state, void *Py_UNUSED(ctx), size_t nbytes)
          * There is a used pool for this size class.
          * Pick up the head block of its free list.
          */
-        ++pool->ref.count;
+        ++pool->count;
         bp = pool->freeblock;
         assert(bp != NULL);
 
@@ -2454,6 +2455,13 @@ pymalloc_alloc(OMState *state, void *Py_UNUSED(ctx), size_t nbytes)
         bp = allocate_from_new_pool(state, size);
     }
 
+    /* Profile sampled allocations: add to pool's metadata linked list */
+    if (heap_profile_is_enabled()) {
+        poolp alloc_pool = POOL_ADDR(bp);  /* bp may be from allocate_from_new_pool */
+        size_t alloc_size = INDEX2SIZE(alloc_pool->szidx);
+        heap_profile_record_sample(alloc_size, bp, &alloc_pool->metadata);
+    }
+
     return (void *)bp;
 }
 
@@ -2467,7 +2475,9 @@ _PyObject_Malloc(void *ctx, size_t nbytes)
         return ptr;
     }
 
-    ptr = PyMem_RawMalloc(nbytes);
+    ptr = heap_profile_is_enabled()
+        ? heap_profile_alloc_large_block(nbytes, false)
+        : PyMem_RawMalloc(nbytes);
     if (ptr != NULL) {
         raw_allocated_blocks++;
     }
@@ -2488,7 +2498,9 @@ _PyObject_Calloc(void *ctx, size_t nelem, size_t elsize)
         return ptr;
     }
 
-    ptr = PyMem_RawCalloc(nelem, elsize);
+    ptr = heap_profile_is_enabled()
+        ? heap_profile_alloc_large_block(nbytes, true)
+        : PyMem_RawCalloc(nelem, elsize);
     if (ptr != NULL) {
         raw_allocated_blocks++;
     }
@@ -2499,7 +2511,7 @@ _PyObject_Calloc(void *ctx, size_t nelem, size_t elsize)
 static void
 insert_to_usedpool(OMState *state, poolp pool)
 {
-    assert(pool->ref.count > 0);            /* else the pool is empty */
+    assert(pool->count > 0);            /* else the pool is empty */
 
     uint size = pool->szidx;
     poolp next = usedpools[size + size];
@@ -2523,6 +2535,8 @@ insert_to_freepool(OMState *state, poolp pool)
     /* Link the pool to freepools.  This is a singly-linked
      * list, and pool->prevpool isn't used there.
      */
+    assert(pool->metadata == NULL);
+    memset(pool->flags, 0, sizeof(pool->flags));
     struct arena_object *ao = &allarenas[pool->arenaindex];
     pool->nextpool = ao->freepools;
     ao->freepools = pool;
@@ -2699,17 +2713,22 @@ pymalloc_free(OMState *state, void *Py_UNUSED(ctx), void *p)
     }
     /* We allocated this address. */
 
+    /* If this block was profiled, remove from pool's list and release */
+    if (pool->metadata != NULL) {
+        heap_profile_remove_from_pool(pool, (pymem_block *)p);
+    }
+
     /* Link p to the start of the pool's freeblock list.  Since
      * the pool had at least the p block outstanding, the pool
      * wasn't empty (so it's already in a usedpools[] list, or
      * was full and is in no list -- it's not in the freeblocks
      * list in any case).
      */
-    assert(pool->ref.count > 0);            /* else it was empty */
+    assert(pool->count > 0);            /* else it was empty */
     pymem_block *lastfree = pool->freeblock;
     *(pymem_block **)p = lastfree;
     pool->freeblock = (pymem_block *)p;
-    pool->ref.count--;
+    pool->count--;
 
     if (UNLIKELY(lastfree == NULL)) {
         /* Pool was full, so doesn't currently live in any list:
@@ -2725,7 +2744,7 @@ pymalloc_free(OMState *state, void *Py_UNUSED(ctx), void *p)
     /* freeblock wasn't NULL, so the pool wasn't full,
      * and the pool is in a usedpools[] list.
      */
-    if (LIKELY(pool->ref.count != 0)) {
+    if (LIKELY(pool->count != 0)) {
         /* pool isn't empty:  leave it in usedpools */
         return 1;
     }
@@ -2735,6 +2754,7 @@ pymalloc_free(OMState *state, void *Py_UNUSED(ctx), void *p)
      * previously freed pools will be allocated later
      * (being not referenced, they are perhaps paged out).
      */
+    assert(pool->metadata == NULL);
     insert_to_freepool(state, pool);
     return 1;
 }
@@ -2750,8 +2770,8 @@ _PyObject_Free(void *ctx, void *p)
 
     OMState *state = get_state();
     if (UNLIKELY(!pymalloc_free(state, ctx, p))) {
-        /* pymalloc didn't allocate this address */
-        PyMem_RawFree(p);
+        /* Large allocation: prefix only when profiling was active */
+        heap_profile_is_enabled() ? heap_profile_free_large_block(p) : PyMem_RawFree(p);
         raw_allocated_blocks--;
     }
 }
@@ -2842,7 +2862,10 @@ _PyObject_Realloc(void *ctx, void *ptr, size_t nbytes)
         return ptr2;
     }
 
-    return PyMem_RawRealloc(ptr, nbytes);
+    /* Large allocation: realloc = free + new alloc with fresh sampling */
+    return heap_profile_is_enabled()
+        ? heap_profile_realloc_large_block(ptr, nbytes)
+        : PyMem_RawRealloc(ptr, nbytes);
 }
 
 #else   /* ! WITH_PYMALLOC */
@@ -3675,7 +3698,7 @@ pymalloc_print_stats(FILE *out)
             const uint sz = p->szidx;
             uint freeblocks;
 
-            if (p->ref.count == 0) {
+            if (p->count == 0) {
                 /* currently unused */
 #ifdef Py_DEBUG
                 assert(pool_is_in_list(p, allarenas[i].freepools));
@@ -3683,8 +3706,8 @@ pymalloc_print_stats(FILE *out)
                 continue;
             }
             ++numpools[sz];
-            numblocks[sz] += p->ref.count;
-            freeblocks = NUMBLOCKS(sz) - p->ref.count;
+            numblocks[sz] += p->count;
+            freeblocks = NUMBLOCKS(sz) - p->count;
             numfreeblocks[sz] += freeblocks;
 #ifdef Py_DEBUG
             if (freeblocks > 0)

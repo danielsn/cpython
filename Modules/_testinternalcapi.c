@@ -36,6 +36,8 @@
 #include "pycore_pyerrors.h"      // _PyErr_ChainExceptions1()
 #include "pycore_pylifecycle.h"   // _PyInterpreterConfig_InitFromDict()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
+#include "pycore_traceback.h"     // _Py_GetTracebackFrames()
+#include "pycore_heap_profile.h"  // heap_profile_get_first_live, etc.
 #include "pycore_runtime_structs.h" // _PY_NSMALLPOSINTS
 #include "pycore_unicodeobject.h" // _PyUnicode_TransformDecimalAndSpaceToASCII()
 
@@ -1729,6 +1731,387 @@ tracemalloc_get_traceback(PyObject *self, PyObject *args)
 }
 
 
+// Test _Py_GetTracebackFrames() - signal-safe traceback collection
+static PyObject *
+get_traceback_frames(PyObject *self, PyObject *Py_UNUSED(args))
+{
+    PyThreadState *tstate = PyThreadState_Get();
+    if (tstate == NULL) {
+        return NULL;
+    }
+
+    PyTracebackFrameInfo frames[32];
+    int count = _Py_GetTracebackFrames(tstate, frames, 32);
+    if (count < 0) {
+        PyErr_SetString(PyExc_RuntimeError, "invalid or freed thread state");
+        return NULL;
+    }
+
+    PyObject *result = PyList_New(count);
+    if (result == NULL) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        PyObject *t = Py_BuildValue("(sis)", frames[i].filename,
+                                    frames[i].lineno, frames[i].name);
+        if (t == NULL) {
+            Py_DECREF(result);
+            return NULL;
+        }
+        PyList_SET_ITEM(result, i, t);
+    }
+    return result;
+}
+
+// Iterate over heap profile entries. Returns list of (ptr, size,
+// bytes_since_last_sample, allocs_since_last_sample, traceback_frames).
+// traceback_frames is list of (filename, lineno, name) or None if no traceback.
+static PyObject *
+heap_profile_iterate(PyObject *self, PyObject *Py_UNUSED(args))
+{
+    if (!heap_profile_is_enabled()) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "heap profiling not enabled; set PYTHON_HEAP_PROFILE_SAMPLE_BYTES");
+        return NULL;
+    }
+
+    PyObject *result = PyList_New(0);
+    if (result == NULL) {
+        return NULL;
+    }
+
+    Py_traceback_interning_table_t *table = heap_profile_get_interning_table();
+    PyTracebackFrameInfo frames[HEAP_PROFILE_TRACEBACK_MAX];
+
+    for (struct heap_profile_entry *ent = heap_profile_get_first_live(); ent != NULL;
+         ent = heap_profile_get_next(ent)) {
+        PyObject *ptr_obj = (ent->ptr != NULL)
+            ? PyLong_FromVoidPtr((void *)ent->ptr)
+            : Py_None;
+        if (ptr_obj == NULL) {
+            Py_DECREF(result);
+            return NULL;
+        }
+        if (ptr_obj == Py_None) {
+            Py_INCREF(Py_None);
+        }
+
+        PyObject *tb_frames = Py_None;
+        if (ent->traceback_id != NULL && table != NULL) {
+            int n = _Py_traceback_fill_frames(ent->traceback_id, table,
+                                             frames, HEAP_PROFILE_TRACEBACK_MAX);
+            if (n > 0) {
+                tb_frames = PyList_New(n);
+                if (tb_frames == NULL) {
+                    Py_DECREF(ptr_obj);
+                    Py_DECREF(result);
+                    return NULL;
+                }
+                for (int i = 0; i < n; i++) {
+                    PyObject *t = Py_BuildValue("(sis)", frames[i].filename,
+                                                frames[i].lineno,
+                                                frames[i].name);
+                    if (t == NULL) {
+                        Py_DECREF(tb_frames);
+                        Py_DECREF(ptr_obj);
+                        Py_DECREF(result);
+                        return NULL;
+                    }
+                    PyList_SET_ITEM(tb_frames, i, t);
+                }
+            }
+        }
+        PyObject *size_obj = PyLong_FromSize_t(ent->size);
+        PyObject *bytes_obj = PyLong_FromUnsignedLongLong(
+            (unsigned long long)ent->bytes_since_last_sample);
+        PyObject *allocs_obj = PyLong_FromUnsignedLongLong(
+            (unsigned long long)ent->allocs_since_last_sample);
+        if (size_obj == NULL || bytes_obj == NULL || allocs_obj == NULL) {
+            Py_DECREF(ptr_obj);
+            Py_XDECREF(size_obj);
+            Py_XDECREF(bytes_obj);
+            Py_XDECREF(allocs_obj);
+            if (tb_frames != Py_None) {
+                Py_DECREF(tb_frames);
+            }
+            Py_DECREF(result);
+            return NULL;
+        }
+        PyObject *item = Py_BuildValue("OOOOO", ptr_obj, size_obj,
+            bytes_obj, allocs_obj, tb_frames);
+        Py_DECREF(ptr_obj);
+        Py_DECREF(size_obj);
+        Py_DECREF(bytes_obj);
+        Py_DECREF(allocs_obj);
+        if (tb_frames != Py_None) {
+            Py_DECREF(tb_frames);
+        }
+        if (item == NULL) {
+            Py_DECREF(result);
+            return NULL;
+        }
+        if (PyList_Append(result, item) < 0) {
+            Py_DECREF(item);
+            Py_DECREF(result);
+            return NULL;
+        }
+        Py_DECREF(item);
+    }
+    return result;
+}
+
+// Iterate over accumulated samples (freed since last reset). Same format as heap_profile_iterate.
+// ptr is None for accumulated entries (object already freed).
+static PyObject *
+heap_profile_iterate_accumulated(PyObject *self, PyObject *Py_UNUSED(args))
+{
+    if (!heap_profile_is_enabled()) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "heap profiling not enabled; set PYTHON_HEAP_PROFILE_SAMPLE_BYTES");
+        return NULL;
+    }
+
+    PyObject *result = PyList_New(0);
+    if (result == NULL) {
+        return NULL;
+    }
+
+    Py_traceback_interning_table_t *table = heap_profile_get_interning_table();
+    PyTracebackFrameInfo frames[HEAP_PROFILE_TRACEBACK_MAX];
+
+    for (struct heap_profile_entry *ent = heap_profile_get_first_accumulated();
+         ent != NULL; ent = heap_profile_get_next(ent)) {
+        PyObject *ptr_obj = (ent->ptr != NULL)
+            ? PyLong_FromVoidPtr((void *)ent->ptr)
+            : Py_None;
+        if (ptr_obj == NULL) {
+            Py_DECREF(result);
+            return NULL;
+        }
+        if (ptr_obj == Py_None) {
+            Py_INCREF(Py_None);
+        }
+
+        PyObject *tb_frames = Py_None;
+        if (ent->traceback_id != NULL && table != NULL) {
+            int n = _Py_traceback_fill_frames(ent->traceback_id, table,
+                                             frames, HEAP_PROFILE_TRACEBACK_MAX);
+            if (n > 0) {
+                tb_frames = PyList_New(n);
+                if (tb_frames == NULL) {
+                    Py_DECREF(ptr_obj);
+                    Py_DECREF(result);
+                    return NULL;
+                }
+                for (int i = 0; i < n; i++) {
+                    PyObject *t = Py_BuildValue("(sis)", frames[i].filename,
+                                                frames[i].lineno,
+                                                frames[i].name);
+                    if (t == NULL) {
+                        Py_DECREF(tb_frames);
+                        Py_DECREF(ptr_obj);
+                        Py_DECREF(result);
+                        return NULL;
+                    }
+                    PyList_SET_ITEM(tb_frames, i, t);
+                }
+            }
+        }
+        PyObject *size_obj = PyLong_FromSize_t(ent->size);
+        PyObject *bytes_obj = PyLong_FromUnsignedLongLong(
+            (unsigned long long)ent->bytes_since_last_sample);
+        PyObject *allocs_obj = PyLong_FromUnsignedLongLong(
+            (unsigned long long)ent->allocs_since_last_sample);
+        if (size_obj == NULL || bytes_obj == NULL || allocs_obj == NULL) {
+            Py_DECREF(ptr_obj);
+            Py_XDECREF(size_obj);
+            Py_XDECREF(bytes_obj);
+            Py_XDECREF(allocs_obj);
+            if (tb_frames != Py_None) {
+                Py_DECREF(tb_frames);
+            }
+            Py_DECREF(result);
+            return NULL;
+        }
+        PyObject *item = Py_BuildValue("OOOOO", ptr_obj, size_obj,
+            bytes_obj, allocs_obj, tb_frames);
+        Py_DECREF(ptr_obj);
+        Py_DECREF(size_obj);
+        Py_DECREF(bytes_obj);
+        Py_DECREF(allocs_obj);
+        if (tb_frames != Py_None) {
+            Py_DECREF(tb_frames);
+        }
+        if (item == NULL) {
+            Py_DECREF(result);
+            return NULL;
+        }
+        if (PyList_Append(result, item) < 0) {
+            Py_DECREF(item);
+            Py_DECREF(result);
+            return NULL;
+        }
+        Py_DECREF(item);
+    }
+    return result;
+}
+
+// Iterate over all allocation samples since last reset. Same as iterate_accumulated.
+// Allocation list gets a copy at sample time, so this includes all samples.
+static PyObject *
+heap_profile_iterate_allocation_samples(PyObject *self, PyObject *Py_UNUSED(args))
+{
+    return heap_profile_iterate_accumulated(self, NULL);
+}
+
+// Clear accumulated samples and free their storage.
+static PyObject *
+heap_profile_reset_accumulated_impl(PyObject *self, PyObject *Py_UNUSED(args))
+{
+    if (!heap_profile_is_enabled()) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "heap profiling not enabled; set PYTHON_HEAP_PROFILE_SAMPLE_BYTES");
+        return NULL;
+    }
+    heap_profile_reset_accumulated();
+    Py_RETURN_NONE;
+}
+
+/* Export heap profile to pprof/OTel format, return as bytes. For testing. */
+static PyObject *
+heap_profile_export_pprof_bytes(PyObject *self, PyObject *Py_UNUSED(args))
+{
+    if (!heap_profile_is_enabled()) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "heap profiling not enabled; set PYTHON_HEAP_PROFILE_SAMPLE_BYTES");
+        return NULL;
+    }
+    FILE *f = tmpfile();
+    if (f == NULL) {
+        PyErr_SetFromErrno(PyExc_OSError);
+        return NULL;
+    }
+    if (heap_profile_export_pprof(f) < 0) {
+        fclose(f);
+        PyErr_SetString(PyExc_RuntimeError, "heap_profile_export_pprof failed");
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_END) < 0) {
+        fclose(f);
+        return NULL;
+    }
+    long size = ftell(f);
+    if (size < 0) {
+        fclose(f);
+        return NULL;
+    }
+    rewind(f);
+    PyObject *result = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)size);
+    if (result == NULL) {
+        fclose(f);
+        return NULL;
+    }
+    char *buf = PyBytes_AS_STRING(result);
+    size_t n = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    if (n != (size_t)size) {
+        Py_DECREF(result);
+        PyErr_SetString(PyExc_IOError, "failed to read exported profile");
+        return NULL;
+    }
+    return result;
+}
+
+static PyObject *
+heap_profile_export_otel_bytes(PyObject *self, PyObject *Py_UNUSED(args))
+{
+    if (!heap_profile_is_enabled()) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "heap profiling not enabled; set PYTHON_HEAP_PROFILE_SAMPLE_BYTES");
+        return NULL;
+    }
+    FILE *f = tmpfile();
+    if (f == NULL) {
+        PyErr_SetFromErrno(PyExc_OSError);
+        return NULL;
+    }
+    if (heap_profile_export_otel(f) < 0) {
+        fclose(f);
+        PyErr_SetString(PyExc_RuntimeError, "heap_profile_export_otel failed");
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_END) < 0) {
+        fclose(f);
+        return NULL;
+    }
+    long size = ftell(f);
+    if (size < 0) {
+        fclose(f);
+        return NULL;
+    }
+    rewind(f);
+    PyObject *result = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)size);
+    if (result == NULL) {
+        fclose(f);
+        return NULL;
+    }
+    char *buf = PyBytes_AS_STRING(result);
+    size_t n = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    if (n != (size_t)size) {
+        Py_DECREF(result);
+        PyErr_SetString(PyExc_IOError, "failed to read exported profile");
+        return NULL;
+    }
+    return result;
+}
+
+// Test traceback interning: intern traceback -> traceback_id (dedup by string/frame/traceback)
+static PyObject *
+traceback_intern_test(PyObject *self, PyObject *Py_UNUSED(args))
+{
+    PyThreadState *tstate = PyThreadState_Get();
+    if (tstate == NULL) {
+        return NULL;
+    }
+
+    PyTracebackFrameInfo frames[32];
+    int count = _Py_GetTracebackFrames(tstate, frames, 32);
+    if (count < 0) {
+        PyErr_SetString(PyExc_RuntimeError, "invalid or freed thread state");
+        return NULL;
+    }
+    if (count == 0) {
+        return Py_BuildValue("OO", Py_None, Py_None);
+    }
+
+    Py_traceback_interning_table_t *table = _Py_traceback_interning_table_new(NULL);
+    if (table == NULL) {
+        return NULL;
+    }
+
+    Py_traceback_id_t id1 = _Py_traceback_intern(frames, count, table);
+    if (id1 == NULL) {
+        _Py_traceback_interning_table_free(table);
+        return NULL;
+    }
+
+    /* Same traceback should return same id */
+    Py_traceback_id_t id2 = _Py_traceback_intern(frames, count, table);
+    if (id2 == NULL) {
+        _Py_traceback_release(id1, table);
+        _Py_traceback_interning_table_free(table);
+        return NULL;
+    }
+
+    int same = (id1 == id2);
+    PyObject *result = Py_BuildValue("Oi", PyLong_FromVoidPtr((void *)id1), same);
+    _Py_traceback_release(id1, table);
+    _Py_traceback_release(id2, table);
+    _Py_traceback_interning_table_free(table);
+    return result;
+}
+
 // Test PyThreadState C API
 static PyObject *
 test_tstate_capi(PyObject *self, PyObject *Py_UNUSED(args))
@@ -2890,6 +3273,24 @@ static PyMethodDef module_functions[] = {
      METH_VARARGS | METH_KEYWORDS},
     {"pending_identify", pending_identify, METH_VARARGS, NULL},
     {"_PyTraceMalloc_GetTraceback", tracemalloc_get_traceback, METH_VARARGS},
+    {"get_traceback_frames", get_traceback_frames, METH_NOARGS,
+     "Get current traceback as list of (filename, lineno, name) tuples (signal-safe API)"},
+    {"traceback_intern_test", traceback_intern_test, METH_NOARGS,
+     "Test traceback interning: returns (traceback_id, same_id_on_reintern)"},
+    {"heap_profile_iterate", heap_profile_iterate, METH_NOARGS,
+     "Iterate over heap profile entries. Returns list of (ptr, size, "
+     "bytes_since_last_sample, allocs_since_last_sample, traceback_frames). "
+     "Requires PYTHON_HEAP_PROFILE_SAMPLE_BYTES to be set."},
+    {"heap_profile_iterate_accumulated", heap_profile_iterate_accumulated, METH_NOARGS,
+     "Iterate over all samples since last reset (copy added at sample time). Same format as heap_profile_iterate."},
+    {"heap_profile_iterate_allocation_samples", heap_profile_iterate_allocation_samples, METH_NOARGS,
+     "Iterate over all allocation samples: accumulated + live. For allocation profiling."},
+    {"heap_profile_reset_accumulated", heap_profile_reset_accumulated_impl, METH_NOARGS,
+     "Clear accumulated samples and free their storage."},
+    {"heap_profile_export_pprof_bytes", heap_profile_export_pprof_bytes, METH_NOARGS,
+     "Export heap profile to pprof protobuf. Returns bytes. Requires heap profiling enabled."},
+    {"heap_profile_export_otel_bytes", heap_profile_export_otel_bytes, METH_NOARGS,
+     "Export heap profile to OTel protobuf. Returns bytes. Requires heap profiling enabled."},
     {"test_tstate_capi", test_tstate_capi, METH_NOARGS, NULL},
     {"_PyUnicode_TransformDecimalAndSpaceToASCII", unicode_transformdecimalandspacetoascii, METH_O},
     {"check_pyobject_forbidden_bytes_is_freed",
