@@ -397,7 +397,7 @@ build_pprof_profile(dynbuf_t *profile_buf, Py_traceback_interning_table_t *table
 
     /* First pass: collect all unique frames from live and allocation list */
     PyTracebackFrameInfoWithIds frames[HEAP_EXPORT_TRACEBACK_MAX];
-    for (struct heap_profile_entry *ent = heap_profile_get_first(); ent != NULL;
+    for (struct heap_profile_entry *ent = heap_profile_get_first_live(); ent != NULL;
          ent = heap_profile_get_next(ent)) {
         if (ent->traceback_id == NULL) continue;
         int n = _Py_traceback_fill_frames_with_string_ids(ent->traceback_id, table,
@@ -457,7 +457,7 @@ build_pprof_profile(dynbuf_t *profile_buf, Py_traceback_interning_table_t *table
     PyMem_RawFree(vt_buf.data);
 
     /* Encode samples from live and allocation list */
-    for (struct heap_profile_entry *ent = heap_profile_get_first(); ent != NULL;
+    for (struct heap_profile_entry *ent = heap_profile_get_first_live(); ent != NULL;
          ent = heap_profile_get_next(ent)) {
         uint64_t loc_ids[HEAP_EXPORT_TRACEBACK_MAX];
         int64_t values[2] = {
@@ -983,7 +983,7 @@ build_otel_profile(dynbuf_t *profile_buf, Py_traceback_interning_table_t *table)
 
     /* Aggregate samples by stacktrace from live and allocation list */
     Py_traceback_frame_id_t frame_ids[HEAP_EXPORT_TRACEBACK_MAX];
-    for (struct heap_profile_entry *ent = heap_profile_get_first(); ent != NULL;
+    for (struct heap_profile_entry *ent = heap_profile_get_first_live(); ent != NULL;
          ent = heap_profile_get_next(ent)) {
         uint32_t locs[HEAP_EXPORT_TRACEBACK_MAX];
         size_t nloc = 0;

@@ -28,15 +28,15 @@ extern "C" {
 #define HEAP_PROFILE_LARGE_PREFIX sizeof(void *)
 
 struct heap_profile_entry {
+    struct heap_profile_entry *next;       /* per-pool list (pool->metadata) */
+    struct heap_profile_entry *global_next;
+    struct heap_profile_entry *global_prev;
     pymem_block *ptr;
     size_t size;
     /* Statistical upscaling: this sample represents these since last sample. */
     uint64_t bytes_since_last_sample;   /* weight in bytes */
     uint64_t allocs_since_last_sample;  /* weight in allocation count */
     Py_traceback_id_t traceback_id;  /* interned; NULL if none */
-    struct heap_profile_entry *next;       /* per-pool list (pool->metadata) */
-    struct heap_profile_entry *global_next;
-    struct heap_profile_entry *global_prev;
 };
 
 /* API for obmalloc.c */
@@ -70,11 +70,11 @@ PyAPI_FUNC(int) heap_profile_is_enabled(void);
 
 /* Get first/next entry in the global list. Returns NULL at end or when disabled.
  * Safe to call; entries may be removed by other threads during iteration. */
-PyAPI_FUNC(struct heap_profile_entry *) heap_profile_get_first(void);
+PyAPI_FUNC(struct heap_profile_entry *) heap_profile_get_first_live(void);
 PyAPI_FUNC(struct heap_profile_entry *) heap_profile_get_next(struct heap_profile_entry *ent);
 
 /* Allocation list: copy of every sample since last reset (added at sample time).
- * heap_profile_get_first_accumulated/get_next iterate over them.
+ * heap_profile_get_first_live and get_first_accumulated + get_next iterate over them.
  * heap_profile_reset_accumulated() clears the list and frees entries. */
 PyAPI_FUNC(struct heap_profile_entry *) heap_profile_get_first_accumulated(void);
 PyAPI_FUNC(void) heap_profile_reset_accumulated(void);

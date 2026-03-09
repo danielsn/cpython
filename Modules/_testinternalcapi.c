@@ -37,7 +37,7 @@
 #include "pycore_pylifecycle.h"   // _PyInterpreterConfig_InitFromDict()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
 #include "pycore_traceback.h"     // _Py_GetTracebackFrames()
-#include "pycore_heap_profile.h"  // heap_profile_get_first, etc.
+#include "pycore_heap_profile.h"  // heap_profile_get_first_live, etc.
 #include "pycore_runtime_structs.h" // _PY_NSMALLPOSINTS
 #include "pycore_unicodeobject.h" // _PyUnicode_TransformDecimalAndSpaceToASCII()
 
@@ -1783,7 +1783,7 @@ heap_profile_iterate(PyObject *self, PyObject *Py_UNUSED(args))
     Py_traceback_interning_table_t *table = heap_profile_get_interning_table();
     PyTracebackFrameInfo frames[HEAP_PROFILE_TRACEBACK_MAX];
 
-    for (struct heap_profile_entry *ent = heap_profile_get_first(); ent != NULL;
+    for (struct heap_profile_entry *ent = heap_profile_get_first_live(); ent != NULL;
          ent = heap_profile_get_next(ent)) {
         PyObject *ptr_obj = (ent->ptr != NULL)
             ? PyLong_FromVoidPtr((void *)ent->ptr)

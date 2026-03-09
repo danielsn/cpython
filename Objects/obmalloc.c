@@ -2475,11 +2475,9 @@ _PyObject_Malloc(void *ctx, size_t nbytes)
         return ptr;
     }
 
-    if (heap_profile_is_enabled()) {
-        ptr = heap_profile_alloc_large_block(nbytes, false);
-    } else {
-        ptr = PyMem_RawMalloc(nbytes);
-    }
+    ptr = heap_profile_is_enabled()
+        ? heap_profile_alloc_large_block(nbytes, false)
+        : PyMem_RawMalloc(nbytes);
     if (ptr != NULL) {
         raw_allocated_blocks++;
     }
@@ -2500,11 +2498,9 @@ _PyObject_Calloc(void *ctx, size_t nelem, size_t elsize)
         return ptr;
     }
 
-    if (heap_profile_is_enabled()) {
-        ptr = heap_profile_alloc_large_block(nbytes, true);
-    } else {
-        ptr = PyMem_RawCalloc(nelem, elsize);
-    }
+    ptr = heap_profile_is_enabled()
+        ? heap_profile_alloc_large_block(nbytes, true)
+        : PyMem_RawCalloc(nelem, elsize);
     if (ptr != NULL) {
         raw_allocated_blocks++;
     }
@@ -2775,11 +2771,7 @@ _PyObject_Free(void *ctx, void *p)
     OMState *state = get_state();
     if (UNLIKELY(!pymalloc_free(state, ctx, p))) {
         /* Large allocation: prefix only when profiling was active */
-        if (heap_profile_is_enabled()) {
-            heap_profile_free_large_block(p);
-        } else {
-            PyMem_RawFree(p);
-        }
+        heap_profile_is_enabled() ? heap_profile_free_large_block(p) : PyMem_RawFree(p);
         raw_allocated_blocks--;
     }
 }
@@ -2871,15 +2863,9 @@ _PyObject_Realloc(void *ctx, void *ptr, size_t nbytes)
     }
 
     /* Large allocation: realloc = free + new alloc with fresh sampling */
-    if (heap_profile_is_enabled()) {
-        return heap_profile_realloc_large_block(ptr, nbytes);
-    } else {
-        void *new_block = PyMem_RawRealloc(ptr, nbytes);
-        if (new_block != NULL) {
-            return new_block;
-        }
-    }
-    return NULL;
+    return heap_profile_is_enabled()
+        ? heap_profile_realloc_large_block(ptr, nbytes)
+        : PyMem_RawRealloc(ptr, nbytes);
 }
 
 #else   /* ! WITH_PYMALLOC */
