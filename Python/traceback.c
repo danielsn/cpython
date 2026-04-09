@@ -1029,85 +1029,224 @@ _Py_DumpWideString(int fd, wchar_t *str)
 #endif
 
 
-/* Write a frame into the file fd: "File "xxx", line xxx in xxx".
 
-   This function is signal safe.
-
-   Return 0 on success. Return -1 if the frame is invalid. */
-
-static int _Py_NO_SANITIZE_THREAD
-dump_frame(int fd, _PyInterpreterFrame *frame)
+static bool _Py_NO_SANITIZE_THREAD
+tstate_is_freed(PyThreadState *tstate)
 {
-    if (frame->owner == FRAME_OWNED_BY_INTERPRETER) {
-        /* Ignore trampoline frames and base frame sentinel */
+    return (_PyMem_IsPtrFreed(tstate) ||
+            _PyMem_IsPtrFreed(tstate->interp) ||
+            _PyMem_IsULongFreed(tstate->thread_id));
+}
+
+
+static bool _Py_NO_SANITIZE_THREAD
+interp_is_freed(PyInterpreterState *interp)
+{
+    return _PyMem_IsPtrFreed(interp);
+}
+
+
+/* Write the ASCII (backslash-escaped) representation of text into buf,
+   null-terminating the result.  buf must be at least _Py_FRAMEINFO_STRSIZE
+   bytes.  At most _Py_FRAMEINFO_STRSIZE-4 content bytes are written; if the
+   output would be longer it is truncated and "..." is appended.  Returns the
+   number of bytes written (excluding '\0').  Writes an empty string and
+   returns 0 if text is NULL or not a unicode object.
+
+   This function does not acquire or release the GIL, modify reference counts,
+   or allocate heap memory. */
+static Py_ssize_t _Py_NO_SANITIZE_THREAD
+format_ascii(char *buf, PyObject *text)
+{
+    static const char hex[] = "0123456789abcdef";
+
+    if (text == NULL || !PyUnicode_Check(text)) {
+        buf[0] = '\0';
         return 0;
     }
 
+    PyASCIIObject *ascii = _PyASCIIObject_CAST(text);
+    Py_ssize_t srclen = ascii->length;
+    int kind = ascii->state.kind;
+    void *data;
+
+    if (ascii->state.compact) {
+        data = ascii->state.ascii ? (void *)(ascii + 1)
+                                  : (void *)(_PyCompactUnicodeObject_CAST(text) + 1);
+    }
+    else {
+        data = _PyUnicodeObject_CAST(text)->data.any;
+        if (data == NULL) {
+            buf[0] = '\0';
+            return 0;
+        }
+    }
+
+    char *out = buf;
+    /* Reserve 4 bytes at the end for "...\0". */
+    char *limit = buf + _Py_FRAMEINFO_STRSIZE - 4;
+    int truncated = 0;
+
+    for (Py_ssize_t i = 0; i < srclen; i++) {
+        Py_UCS4 ch = PyUnicode_READ(kind, data, i);
+        if (' ' <= ch && ch <= 126) {
+            if (out >= limit) { truncated = 1; break; }
+            *out++ = (char)ch;
+        }
+        else if (ch <= 0xff) {
+            if (out + 4 > limit) { truncated = 1; break; }
+            out[0] = '\\'; out[1] = 'x';
+            out[2] = hex[(ch >> 4) & 0xf]; out[3] = hex[ch & 0xf];
+            out += 4;
+        }
+        else if (ch <= 0xffff) {
+            if (out + 6 > limit) { truncated = 1; break; }
+            out[0] = '\\'; out[1] = 'u';
+            out[2] = hex[(ch >> 12) & 0xf]; out[3] = hex[(ch >> 8) & 0xf];
+            out[4] = hex[(ch >>  4) & 0xf]; out[5] = hex[ch & 0xf];
+            out += 6;
+        }
+        else {
+            if (out + 10 > limit) { truncated = 1; break; }
+            out[0] = '\\'; out[1] = 'U';
+            out[2] = hex[(ch >> 28) & 0xf]; out[3] = hex[(ch >> 24) & 0xf];
+            out[4] = hex[(ch >> 20) & 0xf]; out[5] = hex[(ch >> 16) & 0xf];
+            out[6] = hex[(ch >> 12) & 0xf]; out[7] = hex[(ch >>  8) & 0xf];
+            out[8] = hex[(ch >>  4) & 0xf]; out[9] = hex[ch & 0xf];
+            out += 10;
+        }
+    }
+    if (truncated) {
+        out[0] = '.'; out[1] = '.'; out[2] = '.';
+        out += 3;
+    }
+    *out = '\0';
+    return out - buf;
+}
+
+
+/* Collect info from a single frame into *out.
+   Returns 1 if *out was filled, 0 if the frame should be skipped
+   (trampoline/sentinel), -1 if the frame is invalid.
+
+   This function is intended for use in crash scenarios such as signal handlers
+   for SIGSEGV, where the interpreter may be in an inconsistent state.  Given
+   that it reads interpreter data structures that may be partially modified, the
+   function might produce incomplete output or it may even crash itself.
+
+   This function does not acquire or release the GIL, modify reference counts,
+   or allocate heap memory. */
+static int _Py_NO_SANITIZE_THREAD
+collect_frame(_PyInterpreterFrame *frame, _Py_FrameInfo *out)
+{
+    if (frame->owner == FRAME_OWNED_BY_INTERPRETER) {
+        /* Trampoline frames and the base-frame sentinel carry no Python
+           code object; skip them silently. */
+        return 0;
+    }
     PyCodeObject *code = _PyFrame_SafeGetCode(frame);
     if (code == NULL) {
         return -1;
     }
-
-    int res = 0;
-    PUTS(fd, "  File ");
-    if (code->co_filename != NULL
-        && PyUnicode_Check(code->co_filename))
-    {
-        PUTS(fd, "\"");
-        _Py_DumpASCII(fd, code->co_filename);
-        PUTS(fd, "\"");
-    }
-    else {
-        PUTS(fd, "???");
-        res = -1;
-    }
-
-    PUTS(fd, ", line ");
+    format_ascii(out->filename, code->co_filename);
     int lasti = _PyFrame_SafeGetLasti(frame);
-    int lineno = -1;
-    if (lasti >= 0) {
-        lineno = _PyCode_SafeAddr2Line(code, lasti);
-    }
-    if (lineno >= 0) {
-        _Py_DumpDecimal(fd, (size_t)lineno);
-    }
-    else {
-        PUTS(fd, "???");
-        res = -1;
-    }
-
-    PUTS(fd, " in ");
-    if (code->co_name != NULL && PyUnicode_Check(code->co_name)) {
-        _Py_DumpASCII(fd, code->co_name);
-    }
-    else {
-        PUTS(fd, "???");
-        res = -1;
-    }
-    PUTS(fd, "\n");
-    return res;
-}
-
-static int _Py_NO_SANITIZE_THREAD
-tstate_is_freed(PyThreadState *tstate)
-{
-    if (_PyMem_IsPtrFreed(tstate)) {
-        return 1;
-    }
-    if (_PyMem_IsPtrFreed(tstate->interp)) {
-        return 1;
-    }
-    if (_PyMem_IsULongFreed(tstate->thread_id)) {
-        return 1;
-    }
-    return 0;
+    out->lineno = (lasti >= 0) ? _PyCode_SafeAddr2Line(code, lasti) : -1;
+    format_ascii(out->name, code->co_name);
+    return 1;
 }
 
 
-static int _Py_NO_SANITIZE_THREAD
-interp_is_freed(PyInterpreterState *interp)
+/* Collect up to max_frames frames from tstate into the caller-supplied frames
+   array.  Returns the number of frames written (0..max_frames), or -1 if
+   tstate is freed or has no current Python frame.
+
+   The caller does not need to hold an attached thread state, nor does tstate
+   need to be attached.
+
+   This function is intended for use in crash scenarios such as signal handlers
+   for SIGSEGV, where the interpreter may be in an inconsistent state.  Given
+   that it reads interpreter data structures that may be partially modified, the
+   function might produce incomplete output or it may even crash itself.
+
+   This function does not acquire or release the GIL, modify reference counts,
+   or allocate heap memory. */
+int _Py_NO_SANITIZE_THREAD
+PyUnstable_CollectTraceback(PyThreadState *tstate, PyUnstable_FrameInfo *frames,
+                            int max_frames)
 {
-    return _PyMem_IsPtrFreed(interp);
+    if (tstate_is_freed(tstate)) {
+        return -1;
+    }
+    _PyInterpreterFrame *frame = tstate->current_frame;
+    if (frame == NULL) {
+        return -1;
+    }
+    int n = 0;
+    while (frame != NULL && n < max_frames) {
+        if (_PyMem_IsPtrFreed(frame)) {
+            break;
+        }
+        /* Read frame->previous before touching frame fields in case memory
+           is freed during collect_frame(). */
+        _PyInterpreterFrame *previous = frame->previous;
+        int r = collect_frame(frame, &frames[n]);
+        if (r > 0) {
+            n++;
+        }
+        else if (r < 0) {
+            break;
+        }
+        frame = previous;
+    }
+    return n;
+}
+
+
+/* Write a previously-collected traceback to fd.  n_frames is the value
+   returned by _Py_CollectTraceback(); pass write_header=1 to emit the
+   "Stack (most recent call first):" header line.
+
+   This function is intended for use in crash scenarios such as signal handlers
+   for SIGSEGV, where the interpreter may be in an inconsistent state.  Given
+   that it reads interpreter data structures that may be partially modified, the
+   function might produce incomplete output or it may even crash itself.
+
+   This function does not acquire or release the GIL, modify reference counts,
+   or allocate heap memory. */
+void _Py_NO_SANITIZE_THREAD
+PyUnstable_PrintTraceback(int fd, const PyUnstable_FrameInfo *frames,
+                          int n_frames, int write_header)
+{
+    if (write_header) {
+        PUTS(fd, "Stack (most recent call first):\n");
+    }
+    for (int i = 0; i < n_frames; i++) {
+        const _Py_FrameInfo *fi = &frames[i];
+        PUTS(fd, "  File ");
+        if (fi->filename[0] != '\0') {
+            PUTS(fd, "\"");
+            PUTS(fd, fi->filename);
+            PUTS(fd, "\"");
+        }
+        else {
+            PUTS(fd, "???");
+        }
+        PUTS(fd, ", line ");
+        if (fi->lineno >= 0) {
+            _Py_DumpDecimal(fd, (size_t)fi->lineno);
+        }
+        else {
+            PUTS(fd, "???");
+        }
+        PUTS(fd, " in ");
+        if (fi->name[0] != '\0') {
+            PUTS(fd, fi->name);
+        }
+        else {
+            PUTS(fd, "???");
+        }
+        PUTS(fd, "\n");
+    }
 }
 
 
@@ -1129,35 +1268,25 @@ dump_traceback(int fd, PyThreadState *tstate, int write_header)
         return;
     }
 
-    unsigned int depth = 0;
-    while (1) {
-        if (MAX_FRAME_DEPTH <= depth) {
-            if (MAX_FRAME_DEPTH < depth) {
-                PUTS(fd, "plus ");
-                _Py_DumpDecimal(fd, depth);
-                PUTS(fd, " frames\n");
-            }
-            break;
-        }
-
+    /* Process one frame at a time to keep stack usage bounded: a stack array
+       of MAX_FRAME_DEPTH _Py_FrameInfo structs would overflow the alternate
+       signal stack. */
+    int depth = 0;
+    while (frame != NULL && depth < MAX_FRAME_DEPTH) {
         if (_PyMem_IsPtrFreed(frame)) {
-            PUTS(fd, "  <freed frame>\n");
             break;
         }
-        // Read frame->previous early since memory can be freed during
-        // dump_frame()
         _PyInterpreterFrame *previous = frame->previous;
-
-        if (dump_frame(fd, frame) < 0) {
-            PUTS(fd, "  <invalid frame>\n");
+        _Py_FrameInfo fi;
+        int r = collect_frame(frame, &fi);
+        if (r > 0) {
+            _Py_PrintTraceback(fd, &fi, 1, 0);
+            depth++;
+        }
+        else if (r < 0) {
             break;
         }
-
         frame = previous;
-        if (frame == NULL) {
-            break;
-        }
-        depth++;
     }
 }
 
