@@ -206,6 +206,15 @@
 #define PyDoc_STR(str) ""
 #endif
 
+/* Branch prediction hints. Use for hot-path conditions. */
+#if (defined(__clang__) || (defined(__GNUC__) && (__GNUC__ > 2))) && defined(__OPTIMIZE__)
+#  define Py_LIKELY(x)   __builtin_expect(!!(x), 1)
+#  define Py_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#  define Py_LIKELY(x)   (x)
+#  define Py_UNLIKELY(x) (x)
+#endif
+
 /* Below "a" is a power of 2. */
 /* Round down size "n" to be a multiple of "a". */
 #define _Py_SIZE_ROUND_DOWN(n, a) ((size_t)(n) & ~(size_t)((a) - 1))
