@@ -2796,19 +2796,14 @@ class TestInternalFrameApi(unittest.TestCase):
         self.assertIs(frame_from_c, sys._getframe(0))
 
     def test_getnextcomplete_matches_f_back(self):
-        # GetNextComplete must return the same frame as f_back for a live frame.
-        current = _testinternalcapi.tstate_getframe()
-        back_from_c = _testinternalcapi.iframe_getnextcomplete(current)
-        self.assertIs(back_from_c, current.f_back)
-
-    def test_getnextcomplete_outermost_is_none(self):
-        # Walking with iframe_getnextcomplete must eventually return None.
-        f = _testinternalcapi.tstate_getframe()
-        prev = _testinternalcapi.iframe_getnextcomplete(f)
-        while prev is not None:
-            f = prev
-            prev = _testinternalcapi.iframe_getnextcomplete(f)
-        self.assertIsNone(_testinternalcapi.iframe_getnextcomplete(f))
+        # GetNextComplete must match f_back at every step, all the way to None.
+        c_frame = _testinternalcapi.tstate_getframe()
+        py_frame = sys._getframe(0)
+        while c_frame is not None:
+            self.assertIs(c_frame, py_frame)
+            c_frame = _testinternalcapi.iframe_getnextcomplete(c_frame)
+            py_frame = py_frame.f_back
+        self.assertIsNone(py_frame)
 
     def test_stack_to_yaml(self):
         # stack_to_yaml uses only signal-safe operations for the walk and
@@ -2848,23 +2843,6 @@ class TestInternalFrameApi(unittest.TestCase):
         for f in frames:
             self.assertTrue(f.get('filename'), f)
             self.assertIsInstance(f.get('lineno'), int, f)
-
-    def test_stack_walk_matches_python(self):
-        # Walking with tstate_getframe + iframe_getnextcomplete must visit the same
-        # frames in the same order as walking with sys._getframe + f_back.
-        c_names = []
-        f = _testinternalcapi.tstate_getframe()
-        while f is not None:
-            c_names.append(f.f_code.co_name)
-            f = _testinternalcapi.iframe_getnextcomplete(f)
-
-        py_names = []
-        f = sys._getframe(0)
-        while f is not None:
-            py_names.append(f.f_code.co_name)
-            f = f.f_back
-
-        self.assertEqual(c_names, py_names)
 
     def test_getcodesafe_matches_fcode(self):
         # GetCodeSafe must return the same code object as frame.f_code.
