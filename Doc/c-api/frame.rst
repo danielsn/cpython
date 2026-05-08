@@ -231,12 +231,12 @@ Unless using :pep:`523`, you will not need this.
 
    If allocation and reference count changes are not permitted (for example,
    from a signal handler or a custom memory allocator), use
-   :c:func:`PyUnstable_InterpreterFrame_BorrowCode` instead.
+   :c:func:`PyUnstable_InterpreterFrame_GetCodeSafe` instead.
 
    .. versionadded:: 3.12
 
 
-.. c:function:: PyObject* PyUnstable_InterpreterFrame_BorrowCode(struct _PyInterpreterFrame *frame);
+.. c:function:: PyObject* PyUnstable_InterpreterFrame_GetCodeSafe(struct _PyInterpreterFrame *frame);
 
    Return a :term:`borrowed reference` to the code object for the frame.
    The reference is valid as long as the frame is alive.
@@ -265,50 +265,25 @@ Unless using :pep:`523`, you will not need this.
    .. versionadded:: 3.12
 
 
-.. c:function:: int PyUnstable_Code_GetLineNumber(PyCodeObject *code, int addr)
+.. c:function:: int PyUnstable_InterpreterFrame_GetLineSafe(struct _PyInterpreterFrame *frame)
 
-   Return the line number for the given byte offset *addr* in *code*.
-   *addr* is a byte offset as returned by
-   :c:func:`PyUnstable_InterpreterFrame_GetLasti`.  Returns ``-1`` if no
-   line number can be determined.  Does not raise an exception.
+   Return the currently executing line number, or ``-1`` if there is no line
+   number or the frame is invalid.  Does not raise an exception.
 
-   Unlike :c:func:`PyCode_Addr2Line`, validates *addr* before accessing the
-   line table rather than asserting it, making it safe to call when the frame
-   state may be partially torn down.
-
-   .. versionadded:: 3.15
-
-
-.. c:function:: PyObject* PyUnstable_Code_BorrowFilename(PyCodeObject *code)
-
-   Return a :term:`borrowed reference` to the filename (:attr:`~codeobject.co_filename`)
-   of *code*, or ``NULL`` if not set.  The reference is valid as long as the
-   code object is alive.
-
-   Does not allocate memory, does not change any reference counts, and does
-   not acquire or release the GIL.  Safe to call from a signal handler.
-
-   .. versionadded:: 3.15
-
-
-.. c:function:: PyObject* PyUnstable_Code_BorrowName(PyCodeObject *code)
-
-   Return a :term:`borrowed reference` to the function name (:attr:`~codeobject.co_name`)
-   of *code*, or ``NULL`` if not set.  The reference is valid as long as the
-   code object is alive.
-
-   Does not allocate memory, does not change any reference counts, and does
-   not acquire or release the GIL.  Safe to call from a signal handler.
+   Unlike :c:func:`PyUnstable_InterpreterFrame_GetLine`, validates the code
+   object and instruction offset before accessing the line table rather than
+   asserting them, making it safe to call when the frame state may be
+   partially torn down.
 
    .. versionadded:: 3.15
 
 
 .. c:function:: struct _PyInterpreterFrame* PyUnstable_ThreadState_GetInterpreterFrame(PyThreadState *tstate)
 
-   Return the current interpreter frame of *tstate*, or ``NULL`` if the thread
-   has no current frame or freed memory is detected.  The returned frame may be
-   incomplete; use :c:func:`PyUnstable_InterpreterFrame_IsIncomplete` to skip
-   such frames during stack walking.
+   Return the innermost complete interpreter frame of *tstate*, or ``NULL`` if
+   the thread has no complete frame or freed memory is detected.  Incomplete
+   frames (interpreter entry trampolines and frames that have not yet begun
+   executing) are skipped automatically.
 
    Does not allocate memory, does not raise an exception, and does not acquire
    or release the GIL.  Safe to call from a signal handler; racy reads from
@@ -316,48 +291,21 @@ Unless using :pep:`523`, you will not need this.
    not 100% reliable in the presence of concurrent deallocation.
 
    To iterate over the full call stack, call
-   :c:func:`PyUnstable_InterpreterFrame_GetBack` repeatedly on the returned
-   frame until it returns ``NULL``.  See also
-   :c:func:`PyUnstable_InterpreterFrame_IsIncomplete`.
+   :c:func:`PyUnstable_InterpreterFrame_GetNextComplete` repeatedly on the
+   returned frame until it returns ``NULL``.
 
    .. versionadded:: 3.15
 
 
-.. c:function:: struct _PyInterpreterFrame* PyUnstable_InterpreterFrame_GetBack(struct _PyInterpreterFrame *frame)
+.. c:function:: struct _PyInterpreterFrame* PyUnstable_InterpreterFrame_GetNextComplete(struct _PyInterpreterFrame *frame)
 
-   Return the previous (calling) frame, or ``NULL`` if *frame* is the
-   outermost frame or freed memory is detected.  The returned frame may be
-   incomplete; use :c:func:`PyUnstable_InterpreterFrame_IsIncomplete` to skip
-   such frames during stack walking.
+   Return the next (calling) complete frame, or ``NULL`` if *frame* is the
+   outermost complete frame or freed memory is detected.  Incomplete frames are
+   skipped automatically.
 
    Does not allocate memory, does not raise an exception, and does not acquire
    or release the GIL.  Safe to call from a signal handler; racy reads from
    other threads are intentional.  Uses heuristics to detect freed memory —
    not 100% reliable in the presence of concurrent deallocation.
-
-   .. versionadded:: 3.15
-
-
-.. c:function:: int PyUnstable_InterpreterFrame_IsEntry(struct _PyInterpreterFrame *frame)
-
-   Return non-zero if *frame* is an interpreter entry frame — an internal
-   trampoline inserted when C code calls into Python.  Always implies
-   :c:func:`PyUnstable_InterpreterFrame_IsIncomplete`; use ``IsEntry`` only
-   to distinguish entry frames from other incomplete frames.
-
-   Does not allocate memory, does not raise an exception, and does not acquire
-   or release the GIL.  Safe to call from a signal handler.
-
-   .. versionadded:: 3.15
-
-
-.. c:function:: int PyUnstable_InterpreterFrame_IsIncomplete(struct _PyInterpreterFrame *frame)
-
-   Return non-zero if *frame* is incomplete and should be skipped during
-   stack walking.  Covers interpreter entry frames and frames that have not
-   yet begun executing.
-
-   Does not allocate memory, does not raise an exception, and does not acquire
-   or release the GIL.  Safe to call from a signal handler.
 
    .. versionadded:: 3.15

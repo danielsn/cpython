@@ -225,14 +225,11 @@ tracemalloc_get_frame(_PyInterpreterFrame *pyframe, frame_t *frame)
     frame->filename = &_Py_STR(anon_unknown);
 
     int lineno = -1;
-    PyCodeObject *code = (PyCodeObject *)PyUnstable_InterpreterFrame_BorrowCode(pyframe);
+    PyCodeObject *code = (PyCodeObject *)PyUnstable_InterpreterFrame_GetCodeSafe(pyframe);
     if (code == NULL) {
         return;
     }
-    int lasti = PyUnstable_InterpreterFrame_GetLasti(pyframe);
-    if (lasti >= 0) {
-        lineno = PyUnstable_Code_GetLineNumber(code, lasti);
-    }
+    lineno = PyUnstable_InterpreterFrame_GetLineSafe(pyframe);
     if (lineno < 0) {
         lineno = 0;
     }
@@ -311,10 +308,6 @@ traceback_get_frames(traceback_t *traceback)
 
     _PyInterpreterFrame *pyframe = PyUnstable_ThreadState_GetInterpreterFrame(tstate);
     while (pyframe) {
-        if (PyUnstable_InterpreterFrame_IsIncomplete(pyframe)) {
-            pyframe = PyUnstable_InterpreterFrame_GetBack(pyframe);
-            continue;
-        }
         if (traceback->nframe < tracemalloc_config.max_nframe) {
             tracemalloc_get_frame(pyframe, &traceback->frames[traceback->nframe]);
             assert(traceback->frames[traceback->nframe].filename != NULL);
@@ -323,7 +316,7 @@ traceback_get_frames(traceback_t *traceback)
         if (traceback->total_nframe < UINT16_MAX) {
             traceback->total_nframe++;
         }
-        pyframe = PyUnstable_InterpreterFrame_GetBack(pyframe);
+        pyframe = PyUnstable_InterpreterFrame_GetNextComplete(pyframe);
     }
 }
 

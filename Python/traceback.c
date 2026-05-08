@@ -1038,10 +1038,7 @@ _Py_DumpWideString(int fd, wchar_t *str)
 static int _Py_NO_SANITIZE_THREAD
 dump_frame(int fd, _PyInterpreterFrame *frame)
 {
-    if (PyUnstable_InterpreterFrame_IsEntry(frame)) {
-        return 0;
-    }
-    PyCodeObject *code = (PyCodeObject *)PyUnstable_InterpreterFrame_BorrowCode(frame);
+    PyCodeObject *code = (PyCodeObject *)PyUnstable_InterpreterFrame_GetCodeSafe(frame);
     if (code == NULL) {
         return -1;
     }
@@ -1061,11 +1058,7 @@ dump_frame(int fd, _PyInterpreterFrame *frame)
     }
 
     PUTS(fd, ", line ");
-    int lasti = _PyFrame_SafeGetLasti(frame);
-    int lineno = -1;
-    if (lasti >= 0) {
-        lineno = PyUnstable_Code_GetLineNumber(code, lasti);
-    }
+    int lineno = PyUnstable_InterpreterFrame_GetLineSafe(frame);
     if (lineno >= 0) {
         _Py_DumpDecimal(fd, (size_t)lineno);
     }
@@ -1122,9 +1115,6 @@ dump_traceback(int fd, PyThreadState *tstate, int write_header)
     }
 
     _PyInterpreterFrame *frame = PyUnstable_ThreadState_GetInterpreterFrame(tstate);
-    while (frame != NULL && PyUnstable_InterpreterFrame_IsEntry(frame)) {
-        frame = PyUnstable_InterpreterFrame_GetBack(frame);
-    }
     if (frame == NULL) {
         PUTS(fd, "  <no Python frame>\n");
         return;
@@ -1147,7 +1137,7 @@ dump_traceback(int fd, PyThreadState *tstate, int write_header)
         }
         // Read frame->previous early: memory may be freed during dump_frame(),
         // so advance to the next frame while frame is still live.
-        _PyInterpreterFrame *previous = PyUnstable_InterpreterFrame_GetBack(frame);
+        _PyInterpreterFrame *previous = PyUnstable_InterpreterFrame_GetNextComplete(frame);
 
         if (dump_frame(fd, frame) < 0) {
             PUTS(fd, "  <invalid frame>\n");

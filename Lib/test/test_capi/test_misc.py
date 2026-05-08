@@ -2795,22 +2795,20 @@ class TestInternalFrameApi(unittest.TestCase):
         frame_from_c = _testinternalcapi.tstate_getframe()
         self.assertIs(frame_from_c, sys._getframe(0))
 
-    def test_getback_matches_f_back(self):
-        # PyUnstable_InterpreterFrame_GetBack must return the same frame as
-        # f_back for a live (still-on-stack) frame.
+    def test_getnextcomplete_matches_f_back(self):
+        # GetNextComplete must return the same frame as f_back for a live frame.
         current = _testinternalcapi.tstate_getframe()
-        back_from_c = _testinternalcapi.iframe_getback(current)
+        back_from_c = _testinternalcapi.iframe_getnextcomplete(current)
         self.assertIs(back_from_c, current.f_back)
 
-    def test_getback_outermost_is_none(self):
-        # Walking with iframe_getback must eventually return None at the bottom
-        # of the stack.
+    def test_getnextcomplete_outermost_is_none(self):
+        # Walking with iframe_getnextcomplete must eventually return None.
         f = _testinternalcapi.tstate_getframe()
-        prev = _testinternalcapi.iframe_getback(f)
+        prev = _testinternalcapi.iframe_getnextcomplete(f)
         while prev is not None:
             f = prev
-            prev = _testinternalcapi.iframe_getback(f)
-        self.assertIsNone(_testinternalcapi.iframe_getback(f))
+            prev = _testinternalcapi.iframe_getnextcomplete(f)
+        self.assertIsNone(_testinternalcapi.iframe_getnextcomplete(f))
 
     def test_stack_to_yaml(self):
         # stack_to_yaml uses only signal-safe operations for the walk and
@@ -2852,13 +2850,13 @@ class TestInternalFrameApi(unittest.TestCase):
             self.assertIsInstance(f.get('lineno'), int, f)
 
     def test_stack_walk_matches_python(self):
-        # Walking with tstate_getframe + iframe_getback must visit the same
+        # Walking with tstate_getframe + iframe_getnextcomplete must visit the same
         # frames in the same order as walking with sys._getframe + f_back.
         c_names = []
         f = _testinternalcapi.tstate_getframe()
         while f is not None:
             c_names.append(f.f_code.co_name)
-            f = _testinternalcapi.iframe_getback(f)
+            f = _testinternalcapi.iframe_getnextcomplete(f)
 
         py_names = []
         f = sys._getframe(0)
@@ -2868,65 +2866,30 @@ class TestInternalFrameApi(unittest.TestCase):
 
         self.assertEqual(c_names, py_names)
 
-    def test_isentry_live_frame_is_not_entry(self):
-        # A live Python frame on the call stack is not an entry frame.
+    def test_getcodesafe_matches_fcode(self):
+        # GetCodeSafe must return the same code object as frame.f_code.
         frame = _testinternalcapi.tstate_getframe()
-        self.assertFalse(_testinternalcapi.iframe_isentry(frame))
+        self.assertIs(_testinternalcapi.iframe_getcodesafe(frame), frame.f_code)
 
-    def test_isincomplete_live_frame_is_complete(self):
-        # A live frame on the call stack must not be incomplete.
-        frame = _testinternalcapi.tstate_getframe()
-        self.assertFalse(_testinternalcapi.iframe_isincomplete(frame))
 
-    def test_isincomplete_generator_is_always_complete(self):
-        # Frames owned by a generator are defined as always complete,
-        # regardless of whether the generator has been started.
+    def test_iframe_getlinesafe(self):
+        # Use a generator frame frozen at a yield point so that iframe_getlasti
+        # and iframe_getlinesafe both read the same (stable) instruction pointer.
         def gen():
             yield
         g = gen()
-        self.assertFalse(_testinternalcapi.iframe_isincomplete(g.gi_frame))
         next(g)
-        self.assertFalse(_testinternalcapi.iframe_isincomplete(g.gi_frame))
-
-    def test_borrowcode_matches_fcode(self):
-        # BorrowCode must return the same code object as frame.f_code.
-        frame = _testinternalcapi.tstate_getframe()
-        self.assertIs(_testinternalcapi.iframe_borrowcode(frame), frame.f_code)
-
-    def test_borrowfilename_matches_co_filename(self):
-        # BorrowFilename must return the same object as code.co_filename.
-        code = _testinternalcapi.tstate_getframe().f_code
-        self.assertIs(_testinternalcapi.code_borrowfilename(code),
-                      code.co_filename)
-
-    def test_borrowname_matches_co_name(self):
-        # BorrowName must return the same object as code.co_name.
-        code = _testinternalcapi.tstate_getframe().f_code
-        self.assertIs(_testinternalcapi.code_borrowname(code), code.co_name)
-
-    def test_code_getlinenumber(self):
-        # addr < 0 is defined to return co_firstlineno.
-        code = _testinternalcapi.tstate_getframe().f_code
-        self.assertEqual(
-            _testinternalcapi.code_getlinenumber(code, -1),
-            code.co_firstlineno,
-        )
-        # For a specific lasti, Code_GetLineNumber must agree with the
-        # code object's own line table for that same offset.
-        frame = _testinternalcapi.tstate_getframe()
+        frame = g.gi_frame
         lasti = _testinternalcapi.iframe_getlasti(frame)
+        lineno = _testinternalcapi.iframe_getlinesafe(frame)
         if lasti >= 0:
-            # Look up expected line from code object's line table.
             expected = None
-            for start, end, lineno in frame.f_code.co_lines():
-                if lineno is not None and start <= lasti < end:
-                    expected = lineno
+            for start, end, ln in frame.f_code.co_lines():
+                if ln is not None and start <= lasti < end:
+                    expected = ln
                     break
             if expected is not None:
-                self.assertEqual(
-                    _testinternalcapi.code_getlinenumber(frame.f_code, lasti),
-                    expected,
-                )
+                self.assertEqual(lineno, expected)
 
 
 SUFFICIENT_TO_DEOPT_AND_SPECIALIZE = 100

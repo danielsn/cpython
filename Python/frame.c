@@ -151,59 +151,53 @@ PyUnstable_InterpreterFrame_GetLine(_PyInterpreterFrame *frame)
 }
 
 PyObject * _Py_NO_SANITIZE_THREAD
-PyUnstable_InterpreterFrame_BorrowCode(struct _PyInterpreterFrame *frame)
+PyUnstable_InterpreterFrame_GetCodeSafe(struct _PyInterpreterFrame *frame)
 {
     return (PyObject *)_PyFrame_SafeGetCode(frame);
 }
 
 int _Py_NO_SANITIZE_THREAD
-PyUnstable_Code_GetLineNumber(PyCodeObject *code, int addr)
+PyUnstable_InterpreterFrame_GetLineSafe(struct _PyInterpreterFrame *frame)
 {
+    PyCodeObject *code = _PyFrame_SafeGetCode(frame);
+    if (code == NULL) {
+        return -1;
+    }
+    int addr = _PyInterpreterFrame_LASTI(frame) * sizeof(_Py_CODEUNIT);
     return _PyCode_SafeAddr2Line(code, addr);
 }
 
-PyObject * _Py_NO_SANITIZE_THREAD
-PyUnstable_Code_BorrowFilename(PyCodeObject *code)
-{
-    return code->co_filename;
-}
-
-PyObject * _Py_NO_SANITIZE_THREAD
-PyUnstable_Code_BorrowName(PyCodeObject *code)
-{
-    return code->co_name;
-}
-
-int _Py_NO_SANITIZE_THREAD
-PyUnstable_InterpreterFrame_IsEntry(struct _PyInterpreterFrame *frame)
-{
-    return frame->owner == FRAME_OWNED_BY_INTERPRETER;
-}
 
 struct _PyInterpreterFrame * _Py_NO_SANITIZE_THREAD
 PyUnstable_ThreadState_GetInterpreterFrame(PyThreadState *tstate)
 {
     _PyInterpreterFrame *frame = tstate->current_frame;
-    if (frame != NULL && _PyMem_IsPtrFreed(frame)) {
-        return NULL;
+    while (frame != NULL) {
+        if (_PyMem_IsPtrFreed(frame)) {
+            return NULL;
+        }
+        if (!_PyFrame_IsIncomplete(frame)) {
+            return frame;
+        }
+        frame = frame->previous;
     }
-    return frame;
+    return NULL;
 }
 
 struct _PyInterpreterFrame * _Py_NO_SANITIZE_THREAD
-PyUnstable_InterpreterFrame_GetBack(struct _PyInterpreterFrame *frame)
+PyUnstable_InterpreterFrame_GetNextComplete(struct _PyInterpreterFrame *frame)
 {
     _PyInterpreterFrame *previous = frame->previous;
-    if (previous != NULL && _PyMem_IsPtrFreed(previous)) {
-        return NULL;
+    while (previous != NULL) {
+        if (_PyMem_IsPtrFreed(previous)) {
+            return NULL;
+        }
+        if (!_PyFrame_IsIncomplete(previous)) {
+            return previous;
+        }
+        previous = previous->previous;
     }
-    return previous;
-}
-
-int _Py_NO_SANITIZE_THREAD
-PyUnstable_InterpreterFrame_IsIncomplete(struct _PyInterpreterFrame *frame)
-{
-    return _PyFrame_IsIncomplete(frame);
+    return NULL;
 }
 
 const PyTypeObject *const PyUnstable_ExecutableKinds[PyUnstable_EXECUTABLE_KINDS+1] = {

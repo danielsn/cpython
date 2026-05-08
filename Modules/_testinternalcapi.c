@@ -1370,18 +1370,13 @@ _emit_stack_yaml_nosignal(char *buf, int cap, PyThreadState *tstate)
     struct _PyInterpreterFrame *frame =
         PyUnstable_ThreadState_GetInterpreterFrame(tstate);
     while (frame != NULL && pos < cap) {
-        if (PyUnstable_InterpreterFrame_IsIncomplete(frame)) {
-            frame = PyUnstable_InterpreterFrame_GetBack(frame);
-            continue;
-        }
         PyCodeObject *code =
-            (PyCodeObject *)PyUnstable_InterpreterFrame_BorrowCode(frame);
+            (PyCodeObject *)PyUnstable_InterpreterFrame_GetCodeSafe(frame);
         if (code == NULL) { break; }
-        int lasti  = PyUnstable_InterpreterFrame_GetLasti(frame);
-        int lineno = lasti >= 0 ? PyUnstable_Code_GetLineNumber(code, lasti) : -1;
+        int lineno = PyUnstable_InterpreterFrame_GetLineSafe(frame);
 
-        PyObject *filename = PyUnstable_Code_BorrowFilename(code);
-        PyObject *name     = PyUnstable_Code_BorrowName(code);
+        PyObject *filename = code->co_filename;
+        PyObject *name     = code->co_name;
 
         pos = _yaml_lit(buf, pos, cap, "- filename: ");
         if (filename && PyUnicode_IS_ASCII(filename)) {
@@ -1401,7 +1396,7 @@ _emit_stack_yaml_nosignal(char *buf, int cap, PyThreadState *tstate)
         pos = _yaml_decimal(buf, pos, cap, lineno);
         pos = _yaml_lit(buf, pos, cap, "\n");
 
-        frame = PyUnstable_InterpreterFrame_GetBack(frame);
+        frame = PyUnstable_InterpreterFrame_GetNextComplete(frame);
     }
     if (pos >= cap) { return -1; }
     buf[pos] = '\0';
@@ -1427,21 +1422,18 @@ stack_to_yaml(PyObject *self, PyObject *Py_UNUSED(ignored))
 }
 
 static PyObject *
-iframe_getback(PyObject *self, PyObject *frame)
+iframe_getnextcomplete(PyObject *self, PyObject *frame)
 {
     if (!PyFrame_Check(frame)) {
         PyErr_SetString(PyExc_TypeError, "argument must be a frame");
         return NULL;
     }
     struct _PyInterpreterFrame *f = ((PyFrameObject *)frame)->f_frame;
-    struct _PyInterpreterFrame *back = PyUnstable_InterpreterFrame_GetBack(f);
-    while (back != NULL && PyUnstable_InterpreterFrame_IsEntry(back)) {
-        back = PyUnstable_InterpreterFrame_GetBack(back);
-    }
-    if (back == NULL) {
+    struct _PyInterpreterFrame *next = PyUnstable_InterpreterFrame_GetNextComplete(f);
+    if (next == NULL) {
         Py_RETURN_NONE;
     }
-    PyObject *result = (PyObject *)_PyFrame_GetFrameObject(back);
+    PyObject *result = (PyObject *)_PyFrame_GetFrameObject(next);
     if (result == NULL) {
         return NULL;
     }
@@ -1453,9 +1445,6 @@ tstate_getframe(PyObject *self, PyObject *Py_UNUSED(ignored))
 {
     PyThreadState *tstate = _PyThreadState_GET();
     struct _PyInterpreterFrame *f = PyUnstable_ThreadState_GetInterpreterFrame(tstate);
-    while (f != NULL && PyUnstable_InterpreterFrame_IsEntry(f)) {
-        f = PyUnstable_InterpreterFrame_GetBack(f);
-    }
     if (f == NULL) {
         Py_RETURN_NONE;
     }
@@ -1467,83 +1456,30 @@ tstate_getframe(PyObject *self, PyObject *Py_UNUSED(ignored))
 }
 
 static PyObject *
-iframe_isentry(PyObject *self, PyObject *frame)
+iframe_getcodesafe(PyObject *self, PyObject *frame)
 {
     if (!PyFrame_Check(frame)) {
         PyErr_SetString(PyExc_TypeError, "argument must be a frame");
         return NULL;
     }
     struct _PyInterpreterFrame *f = ((PyFrameObject *)frame)->f_frame;
-    return PyBool_FromLong(PyUnstable_InterpreterFrame_IsEntry(f));
-}
-
-static PyObject *
-iframe_isincomplete(PyObject *self, PyObject *frame)
-{
-    if (!PyFrame_Check(frame)) {
-        PyErr_SetString(PyExc_TypeError, "argument must be a frame");
-        return NULL;
-    }
-    struct _PyInterpreterFrame *f = ((PyFrameObject *)frame)->f_frame;
-    return PyBool_FromLong(PyUnstable_InterpreterFrame_IsIncomplete(f));
-}
-
-static PyObject *
-iframe_borrowcode(PyObject *self, PyObject *frame)
-{
-    if (!PyFrame_Check(frame)) {
-        PyErr_SetString(PyExc_TypeError, "argument must be a frame");
-        return NULL;
-    }
-    struct _PyInterpreterFrame *f = ((PyFrameObject *)frame)->f_frame;
-    PyObject *code = PyUnstable_InterpreterFrame_BorrowCode(f);
+    PyObject *code = PyUnstable_InterpreterFrame_GetCodeSafe(f);
     if (code == NULL) {
         Py_RETURN_NONE;
     }
     return Py_NewRef(code);
 }
 
-static PyObject *
-code_borrowfilename(PyObject *self, PyObject *arg)
-{
-    if (!PyCode_Check(arg)) {
-        PyErr_SetString(PyExc_TypeError, "argument must be a code object");
-        return NULL;
-    }
-    PyObject *filename = PyUnstable_Code_BorrowFilename((PyCodeObject *)arg);
-    if (filename == NULL) {
-        Py_RETURN_NONE;
-    }
-    return Py_NewRef(filename);
-}
 
 static PyObject *
-code_borrowname(PyObject *self, PyObject *arg)
+iframe_getlinesafe(PyObject *self, PyObject *frame)
 {
-    if (!PyCode_Check(arg)) {
-        PyErr_SetString(PyExc_TypeError, "argument must be a code object");
+    if (!PyFrame_Check(frame)) {
+        PyErr_SetString(PyExc_TypeError, "argument must be a frame");
         return NULL;
     }
-    PyObject *name = PyUnstable_Code_BorrowName((PyCodeObject *)arg);
-    if (name == NULL) {
-        Py_RETURN_NONE;
-    }
-    return Py_NewRef(name);
-}
-
-static PyObject *
-code_getlinenumber(PyObject *self, PyObject *args)
-{
-    PyObject *code;
-    int addr;
-    if (!PyArg_ParseTuple(args, "Oi", &code, &addr)) {
-        return NULL;
-    }
-    if (!PyCode_Check(code)) {
-        PyErr_SetString(PyExc_TypeError, "first argument must be a code object");
-        return NULL;
-    }
-    return PyLong_FromLong(PyUnstable_Code_GetLineNumber((PyCodeObject *)code, addr));
+    struct _PyInterpreterFrame *f = ((PyFrameObject *)frame)->f_frame;
+    return PyLong_FromLong(PyUnstable_InterpreterFrame_GetLineSafe(f));
 }
 
 static PyObject *
@@ -3169,15 +3105,12 @@ static PyMethodDef module_functions[] = {
     {"iframe_getcode", iframe_getcode, METH_O, NULL},
     {"iframe_getline", iframe_getline, METH_O, NULL},
     {"iframe_getlasti", iframe_getlasti, METH_O, NULL},
-    {"iframe_getback", iframe_getback, METH_O, NULL},
-    {"iframe_isentry", iframe_isentry, METH_O, NULL},
-    {"iframe_isincomplete", iframe_isincomplete, METH_O, NULL},
-    {"iframe_borrowcode", iframe_borrowcode, METH_O, NULL},
+    {"iframe_getnextcomplete", iframe_getnextcomplete, METH_O, NULL},
+    {"iframe_getcodesafe", iframe_getcodesafe, METH_O, NULL},
     {"tstate_getframe", tstate_getframe, METH_NOARGS, NULL},
     {"stack_to_yaml", stack_to_yaml, METH_NOARGS, NULL},
-    {"code_borrowfilename", code_borrowfilename, METH_O, NULL},
-    {"code_borrowname", code_borrowname, METH_O, NULL},
-    {"code_getlinenumber", code_getlinenumber, METH_VARARGS, NULL},
+
+    {"iframe_getlinesafe", iframe_getlinesafe, METH_O, NULL},
     {"code_returns_only_none", code_returns_only_none, METH_O, NULL},
     {"get_co_framesize", get_co_framesize, METH_O, NULL},
     {"get_co_localskinds", get_co_localskinds, METH_O, NULL},
