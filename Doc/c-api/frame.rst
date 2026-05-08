@@ -244,9 +244,9 @@ Unless using :pep:`523`, you will not need this.
    Use this instead of :c:func:`PyUnstable_InterpreterFrame_GetCode` when
    allocation and reference count changes are not permitted (for example,
    from a signal handler or a custom memory allocator).  Does not allocate
-   memory, does not change any reference counts, and does not acquire or
-   release the GIL.  Uses heuristics to detect freed memory — not 100%
-   reliable in the presence of concurrent deallocation.
+   memory, does not change any reference counts, does not acquire or release
+   the GIL, and does not raise an exception.  Uses heuristics to detect freed
+   memory — not 100% reliable in the presence of concurrent deallocation.
 
    .. versionadded:: 3.15
 
@@ -307,5 +307,9 @@ Unless using :pep:`523`, you will not need this.
    or release the GIL.  Safe to call from a signal handler; racy reads from
    other threads are intentional.  Uses heuristics to detect freed memory —
    not 100% reliable in the presence of concurrent deallocation.
+
+   Unlike :c:func:`PyFrame_GetBack`, this function never allocates memory,
+   making it safe to call from a custom memory allocator hook without risking
+   re-entrant allocation.
 
    .. versionadded:: 3.15
