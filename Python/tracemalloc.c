@@ -171,6 +171,39 @@ new_sample_threshold(size_t interval, uint64_t *prng_state)
     return threshold >= 1 ? threshold : 1;
 }
 
+/* Horvitz-Thompson weight for a sampled allocation: the allocation's true
+   size divided by its sampling probability p = 1 - exp(-size/interval).
+
+   This makes the per-trace size an unbiased estimator of the bytes the
+   sample represents, for any allocation size relative to the interval.
+   Crediting the bytes accumulated since the last sample instead would
+   over-attribute allocations that are comparable to or larger than the
+   interval (they sweep up the small allocations pending in the counter)
+   and correspondingly under-attribute the small-allocation tail.
+
+   expm1() keeps p accurate when size << interval, where 1 - exp(-x) would
+   lose nearly all its significant digits to cancellation.  The weight is
+   always at least the real size and is clamped to SIZE_MAX. */
+static size_t
+sample_weight(size_t byte_size, size_t interval)
+{
+    if (byte_size == 0) {
+        return 0;
+    }
+    double p = -expm1(-(double)byte_size / (double)interval);
+    if (p <= 0.0) {
+        /* Defensive: p is mathematically in (0, 1) for byte_size > 0. */
+        return byte_size;
+    }
+    double weight = (double)byte_size / p;
+    if (weight >= (double)SIZE_MAX) {
+        return SIZE_MAX;
+    }
+    size_t w = (size_t)weight;
+    return w >= byte_size ? w : byte_size;
+}
+
+
 static uint64_t
 new_sampling_seed(void)
 {
@@ -256,30 +289,27 @@ new_global_threshold(size_t interval)
 }
 
 
-/* Sampling decision.  Returns true if this allocation should be traced,
-   false if it should be skipped.  When returning true,
-   *effective_size is set: to byte_size in exact mode (interval == 0),
-   or to the upscaled Poisson weight in sampled mode. */
-static bool
-should_sample(size_t byte_size, size_t *effective_size)
+Py_NO_INLINE static bool
+should_sample_slow(size_t byte_size, size_t interval,
+                   _PyThreadStateImpl *tstate, size_t *effective_size)
 {
-    size_t interval = tracemalloc_config.sample_interval;
-    if (interval == 0) {
-        *effective_size = byte_size;
-        return true;
-    }
-    _PyThreadStateImpl *tstate = (_PyThreadStateImpl *)_Py_tss_tstate;
+    assert(interval != 0);
+
     if (tstate != NULL) {
-        /* Per-thread path via _PyThreadStateImpl */
+        /* Per-thread path via _PyThreadStateImpl. */
         tracemalloc_sampling_state_t *s = &tstate->tracemalloc_sampling;
         if (s->prng_state == 0) {
             init_sampling_state(s, interval);
         }
-        s->bytes_since_last_sample += byte_size;
-        if (s->bytes_since_last_sample < s->threshold) {
+
+        assert(s->bytes_since_last_sample < s->threshold);
+        size_t remaining = s->threshold - s->bytes_since_last_sample;
+        if (byte_size < remaining) {
+            s->bytes_since_last_sample += byte_size;
             return false;
         }
-        *effective_size = s->bytes_since_last_sample;
+
+        *effective_size = sample_weight(byte_size, interval);
         s->bytes_since_last_sample = 0;
         s->threshold = new_sample_threshold(interval, &s->prng_state);
         return true;
@@ -337,8 +367,41 @@ should_sample(size_t byte_size, size_t *effective_size)
     if (!sampled) {
         return false;
     }
-    *effective_size = (total > (uint64_t)SIZE_MAX) ? SIZE_MAX : (size_t)total;
+    *effective_size = sample_weight(byte_size, interval);
     return true;
+}
+
+
+/* Sampling decision.  Returns true if this allocation should be traced,
+   false if it should be skipped.  When returning true,
+   *effective_size is set: to byte_size in exact mode (interval == 0),
+   or to the Horvitz-Thompson weight (see sample_weight) in sampled mode. */
+static inline Py_ALWAYS_INLINE bool
+should_sample(size_t byte_size, size_t *effective_size)
+{
+    size_t interval = tracemalloc_config.sample_interval;
+    if (interval == 0) {
+        *effective_size = byte_size;
+        return true;
+    }
+
+    _PyThreadStateImpl *tstate = (_PyThreadStateImpl *)_Py_tss_tstate;
+    if (tstate != NULL) {
+        tracemalloc_sampling_state_t *s = &tstate->tracemalloc_sampling;
+        if (s->prng_state != 0) {
+            /* Common sampled path: this Python thread already has sampling
+               state, and this allocation does not cross the threshold.
+               Use subtraction rather than addition to avoid overflow. */
+            assert(s->bytes_since_last_sample < s->threshold);
+            size_t remaining = s->threshold - s->bytes_since_last_sample;
+            if (byte_size < remaining) {
+                s->bytes_since_last_sample += byte_size;
+                return false;
+            }
+        }
+    }
+
+    return should_sample_slow(byte_size, interval, tstate, effective_size);
 }
 
 
